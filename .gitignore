@@ -1,0 +1,9 @@
+.DS_Store
+/.build
+/dist
+/.swiftpm
+/*.xcodeproj
+/DerivedData
+*.dmg
+*.zip
+*.log

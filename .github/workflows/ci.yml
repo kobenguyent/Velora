@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    name: Build, Test & Verify macOS App Bundle
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Swift & macOS toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Run VeloraCore unit tests
+        run: swift test --parallel
+
+      - name: Build & verify native Velora.app bundle
+        run: |
+          chmod +x scripts/*.sh scripts/*.swift
+          ./scripts/build-app.sh \
+            --arch native \
+            --version "0.0.0-ci" \
+            --build "${{ github.run_number }}" \
+            --github-repo "${{ github.repository }}"
+
+      - name: Upload CI app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Velora-macOS-CI
+          path: dist/Velora.app
+          retention-days: 7

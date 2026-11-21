@@ -1,0 +1,124 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0 or 1.1.0-beta.1)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark GitHub Release as a pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Universal macOS App & Publish GitHub Release
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version & tag
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RAW_VERSION="${{ inputs.version }}"
+            VERSION="${RAW_VERSION#v}"
+            TAG="v${VERSION}"
+            PRERELEASE="${{ inputs.prerelease }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            if [[ "$VERSION" == *-* ]]; then
+              PRERELEASE="true"
+            else
+              PRERELEASE="false"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: tag=$TAG version=$VERSION prerelease=$PRERELEASE"
+
+      - name: Run unit test suite
+        run: swift test --parallel
+
+      - name: Import Apple Developer signing certificate (optional)
+        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/velora-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          echo -n "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Build universal binary & package release artifacts (.dmg, .zip, SHA256SUMS)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          chmod +x scripts/*.sh scripts/*.swift
+          ./scripts/package-release.sh \
+            --arch universal \
+            --version "${{ steps.meta.outputs.version }}" \
+            --build "${{ github.run_number }}" \
+            --github-repo "${{ github.repository }}"
+
+      - name: Prepare release notes
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          cat > dist/RELEASE_NOTES.md <<EOF
+          ## Velora v${VERSION} for macOS (Apple Silicon & Intel Universal)
+
+          ### Artifacts
+          - **\`Velora-${VERSION}-macos-universal.dmg\`** — Drag-to-Applications installer for first-time installation
+          - **\`Velora-${VERSION}-macos-universal.zip\`** — Archive used automatically by Velora's in-app GitHub Releases auto-updater
+          - **\`SHA256SUMS.txt\`** — SHA-256 checksums verified automatically before installing updates
+
+          ### Installing Without a Paid Apple Developer ID (First Launch)
+          Because community builds are ad-hoc signed, macOS Gatekeeper may flag the first launch of a downloaded app. After dragging **Velora.app** to \`/Applications\`, run once in Terminal:
+
+          \`\`\`bash
+          xattr -dr com.apple.quarantine /Applications/Velora.app
+          \`\`\`
+
+          Or go to **System Settings → Privacy & Security** and click **Open Anyway**.
+          Subsequent in-app updates handle quarantine removal and relaunch automatically!
+
+          ### Requirements
+          - macOS 14.0 (Sonoma) or later (Apple Silicon or Intel)
+          - \`yt-dlp\` & \`ffmpeg\` — installable directly in one click from Velora's **Engine Setup** screen (or \`brew install yt-dlp ffmpeg\`)
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Velora v${{ steps.meta.outputs.version }}
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body_path: dist/RELEASE_NOTES.md
+          files: |
+            dist/Velora-${{ steps.meta.outputs.version }}-macos-universal.dmg
+            dist/Velora-${{ steps.meta.outputs.version }}-macos-universal.zip
+            dist/SHA256SUMS.txt
