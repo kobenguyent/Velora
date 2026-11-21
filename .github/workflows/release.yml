@@ -56,11 +56,16 @@ jobs:
         run: swift test --parallel
 
       - name: Import Apple Developer signing certificate (optional)
-        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
         env:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
+          if [[ -z "$APPLE_CERTIFICATE_P12" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo "No Apple Developer signing secrets configured; proceeding with ad-hoc signing."
+            exit 0
+          fi
+
           KEYCHAIN_PATH="$RUNNER_TEMP/velora-signing.keychain-db"
           KEYCHAIN_PASS="$(uuidgen)"
           CERT_PATH="$RUNNER_TEMP/certificate.p12"
