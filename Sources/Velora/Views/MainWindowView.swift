@@ -157,6 +157,23 @@ struct MainWindowView: View {
                 }
             }
         }
+        .sheet(isPresented: $studio.isShowingPlaylistPicker) {
+            if let media = studio.inspectedMedia, media.isPlaylist {
+                PlaylistPickerSheet(
+                    mediaInfo: media,
+                    defaultCreateSubfolder: studio.configuration.createPlaylistSubfolder
+                ) { selectedEntries, createSubfolder, prefixIndex in
+                    studio.queuePlaylistEntries(
+                        selectedEntries,
+                        mediaInfo: media,
+                        downloadManager: downloadManager,
+                        createSubfolder: createSubfolder,
+                        prefixIndex: prefixIndex
+                    )
+                    selection = .queue
+                }
+            }
+        }
     }
 
     private var sidebarContent: some View {

@@ -6,6 +6,9 @@ struct MediaPreviewCard: View {
     let selectedFormatID: String?
     let onOpenFormatPicker: () -> Void
     let onClearFormatOverride: () -> Void
+    let onOpenPlaylistPicker: () -> Void
+    let onQueueAllPlaylist: () -> Void
+    let onLoadLinkedPlaylist: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -23,9 +26,11 @@ struct MediaPreviewCard: View {
                         VeloraBadge(text: extractor, color: VeloraTheme.violet, icon: "globe")
                     }
                     if mediaInfo.isPlaylist, let count = mediaInfo.playlistCount {
-                        VeloraBadge(text: "Playlist · \(count) items", color: VeloraTheme.cyan, icon: "list.bullet.rectangle")
+                        VeloraBadge(text: "Playlist · \(count) videos", color: VeloraTheme.cyan, icon: "list.bullet.rectangle")
                     }
-                    if let duration = mediaInfo.formattedDuration {
+                    if mediaInfo.isPlaylist, let totalDur = mediaInfo.totalPlaylistDurationFormatted {
+                        VeloraBadge(text: totalDur, color: .secondary, icon: "clock")
+                    } else if let duration = mediaInfo.formattedDuration {
                         VeloraBadge(text: duration, color: .secondary, icon: "clock")
                     }
                     Spacer()
@@ -48,7 +53,37 @@ struct MediaPreviewCard: View {
                     }
                 }
 
-                if !mediaInfo.availableHeights.isEmpty {
+                if mediaInfo.isPlaylist && !mediaInfo.playlistEntries.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(mediaInfo.playlistEntries.prefix(3)) { entry in
+                            HStack(spacing: 6) {
+                                Text(String(format: "#%02d", entry.index))
+                                    .font(.system(.caption2, design: .monospaced, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                                Text(entry.title)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                if let dur = entry.formattedDuration {
+                                    Text(dur)
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                        if mediaInfo.playlistEntries.count > 3 {
+                            Text("…and \(mediaInfo.playlistEntries.count - 3) more videos")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                    )
+                } else if !mediaInfo.availableHeights.isEmpty {
                     HStack(spacing: 6) {
                         Text("Detected:")
                             .font(.caption2)
@@ -66,27 +101,67 @@ struct MediaPreviewCard: View {
                 Spacer(minLength: 2)
 
                 HStack(spacing: 8) {
-                    if !mediaInfo.formats.isEmpty {
+                    if mediaInfo.isPlaylist && !mediaInfo.playlistEntries.isEmpty {
                         Button {
-                            onOpenFormatPicker()
+                            onOpenPlaylistPicker()
                         } label: {
                             Label(
-                                selectedFormatID == nil ? "Pick Exact Format (\(mediaInfo.formats.count))" : "Format: \(selectedFormatID!)",
-                                systemImage: "list.bullet.indent"
+                                "Select Videos (\(mediaInfo.availablePlaylistEntries.count))…",
+                                systemImage: "checklist"
+                            )
+                            .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(VeloraTheme.violet)
+                        .controlSize(.small)
+
+                        Button {
+                            onQueueAllPlaylist()
+                        } label: {
+                            Label(
+                                "Queue All \(mediaInfo.availablePlaylistEntries.count)",
+                                systemImage: "arrow.down.circle"
                             )
                             .font(.caption.weight(.medium))
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                    }
-
-                    if selectedFormatID != nil {
-                        Button("Reset Format") {
-                            onClearFormatOverride()
+                    } else {
+                        if !mediaInfo.formats.isEmpty {
+                            Button {
+                                onOpenFormatPicker()
+                            } label: {
+                                Label(
+                                    selectedFormatID == nil ? "Pick Exact Format (\(mediaInfo.formats.count))" : "Format: \(selectedFormatID!)",
+                                    systemImage: "list.bullet.indent"
+                                )
+                                .font(.caption.weight(.medium))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+
+                        if selectedFormatID != nil {
+                            Button("Reset Format") {
+                                onClearFormatOverride()
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+
+                        if mediaInfo.linkedPlaylistURL != nil {
+                            Button {
+                                onLoadLinkedPlaylist()
+                            } label: {
+                                Label("Load Full Playlist", systemImage: "list.bullet.rectangle.portrait")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(VeloraTheme.cyan)
+                            .controlSize(.small)
+                            .help("This video is part of a YouTube playlist — expand to select and bulk-download videos")
+                        }
                     }
                 }
             }
@@ -122,7 +197,7 @@ struct MediaPreviewCard: View {
     private var placeholderThumb: some View {
         ZStack {
             VeloraTheme.brandGradient.opacity(0.22)
-            Image(systemName: "play.rectangle.fill")
+            Image(systemName: mediaInfo.isPlaylist ? "list.bullet.rectangle.fill" : "play.rectangle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
         }

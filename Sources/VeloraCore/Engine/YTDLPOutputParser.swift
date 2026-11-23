@@ -2,6 +2,7 @@ import Foundation
 
 public enum YTDLPOutputEvent: Sendable, Equatable {
     case metadata(title: String, uploader: String?, extractor: String?)
+    case playlistItemProgress(current: Int, total: Int)
     case progress(fraction: Double, speed: String?, eta: String?, totalSize: String?)
     case postProcessing(stage: String)
     case destination(path: String)
@@ -64,6 +65,11 @@ public enum YTDLPOutputParser {
             return .error(message: msg)
         }
 
+        // 4.5 Playlist item progress: "[download] Downloading item 3 of 25" or "Downloading video 3 of 25"
+        if line.hasPrefix("[download]"), let playlistEvent = parsePlaylistItemProgress(line) {
+            return playlistEvent
+        }
+
         // 5. Standard yt-dlp progress fallback:
         // [download]  42.3% of  120.50MiB at    8.42MiB/s ETA 00:08
         if line.hasPrefix("[download]"), let parsed = parseStandardDownloadProgress(line) {
@@ -123,6 +129,20 @@ public enum YTDLPOutputParser {
             return nil
         }
         return trimmed
+    }
+
+    private static func parsePlaylistItemProgress(_ line: String) -> YTDLPOutputEvent? {
+        let pattern = #"\[download\]\s+Downloading\s+(?:item|video)\s+(\d+)\s+of\s+(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              let currentRange = Range(match.range(at: 1), in: line),
+              let totalRange = Range(match.range(at: 2), in: line),
+              let current = Int(line[currentRange]),
+              let total = Int(line[totalRange]),
+              total > 0 else {
+            return nil
+        }
+        return .playlistItemProgress(current: current, total: total)
     }
 
     private static func parseStandardDownloadProgress(_ line: String) -> YTDLPOutputEvent? {

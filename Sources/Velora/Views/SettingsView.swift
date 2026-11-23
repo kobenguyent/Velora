@@ -34,7 +34,7 @@ struct SettingsView: View {
                 Stepper(
                     "Max Concurrent Downloads: \(downloadManager.maxConcurrentDownloads)",
                     value: $downloadManager.maxConcurrentDownloads,
-                    in: 1...6
+                    in: 1...8
                 )
                 Toggle("Play completion sound when downloads finish", isOn: $downloadManager.playSoundOnComplete)
 

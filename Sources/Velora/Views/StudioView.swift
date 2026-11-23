@@ -35,12 +35,37 @@ struct StudioView: View {
                     .veloraCard(padding: 12)
                 }
 
+                if studio.isExpandingBulk {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(studio.bulkExpansionStatus.isEmpty ? "Expanding playlist videos…" : studio.bulkExpansionStatus)
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                    }
+                    .veloraCard(padding: 12)
+                }
+
                 if let media = studio.inspectedMedia {
                     MediaPreviewCard(
                         mediaInfo: media,
                         selectedFormatID: studio.configuration.customFormatID,
                         onOpenFormatPicker: { studio.isShowingFormatPicker = true },
-                        onClearFormatOverride: { studio.configuration.customFormatID = nil }
+                        onClearFormatOverride: { studio.configuration.customFormatID = nil },
+                        onOpenPlaylistPicker: { studio.isShowingPlaylistPicker = true },
+                        onQueueAllPlaylist: {
+                            studio.queuePlaylistEntries(
+                                media.availablePlaylistEntries,
+                                mediaInfo: media,
+                                downloadManager: downloadManager,
+                                createSubfolder: studio.configuration.createPlaylistSubfolder,
+                                prefixIndex: true
+                            )
+                            onNavigateToQueue()
+                        },
+                        onLoadLinkedPlaylist: {
+                            studio.loadLinkedPlaylist(engineManager: engineManager)
+                        }
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
@@ -61,7 +86,7 @@ struct StudioView: View {
             .padding(22)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .onDrop(of: [.url, .plainText], isTargeted: $isDropTargeted) { providers in
+        .onDrop(of: [.fileURL, .url, .plainText], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
         }
         .overlay {
@@ -136,28 +161,71 @@ struct StudioView: View {
             }
 
             if studio.isBatchMode {
-                TextEditor(text: $studio.urlInput)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 84, maxHeight: 130)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(VeloraTheme.subtleCardBorder, lineWidth: 1)
-                    )
-                    .overlay(alignment: .topLeading) {
-                        if studio.urlInput.isEmpty {
-                            Text("Paste multiple URLs (one per line)…")
-                                .font(.callout)
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 12)
-                                .allowsHitTesting(false)
+                VStack(alignment: .leading, spacing: 8) {
+                    TextEditor(text: $studio.urlInput)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 96, maxHeight: 150)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(nsColor: .textBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(VeloraTheme.subtleCardBorder, lineWidth: 1)
+                        )
+                        .overlay(alignment: .topLeading) {
+                            if studio.urlInput.isEmpty {
+                                Text("Paste multiple video or playlist URLs (one per line), or import a .txt list…")
+                                    .font(.callout)
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 12)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            importURLListFile()
+                        } label: {
+                            Label("Import .txt…", systemImage: "doc.text")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Toggle("Expand playlists into parallel downloads", isOn: $studio.expandPlaylistsInBatch)
+                            .font(.caption)
+
+                        Spacer()
+
+                        let urlCount = studio.detectedBatchURLs.count
+                        let playlistCount = studio.detectedBatchPlaylistCount
+                        if urlCount > 0 {
+                            VeloraBadge(
+                                text: "\(urlCount) URL\(urlCount == 1 ? "" : "s")",
+                                color: VeloraTheme.cyan
+                            )
+                            if playlistCount > 0 {
+                                VeloraBadge(
+                                    text: "\(playlistCount) playlist\(playlistCount == 1 ? "" : "s")",
+                                    color: VeloraTheme.violet,
+                                    icon: "list.bullet.rectangle"
+                                )
+                            }
+                        }
+
+                        if !studio.urlInput.isEmpty {
+                            Button("Clear") {
+                                studio.urlInput = ""
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
                     }
+                }
             } else {
                 HStack(spacing: 8) {
                     HStack(spacing: 8) {
@@ -247,15 +315,21 @@ struct StudioView: View {
                 Spacer()
 
                 Button {
-                    studio.startDownload(downloadManager: downloadManager)
+                    studio.startDownload(downloadManager: downloadManager, engineManager: engineManager)
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text(studio.isBatchMode ? "Queue All URLs" : "Download Now")
+                        if studio.isExpandingBulk {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "arrow.down.circle.fill")
+                        }
+                        Text(downloadButtonTitle)
                     }
                 }
-                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: !studio.canDownload))
-                .disabled(!studio.canDownload)
+                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: !studio.canDownload || studio.isExpandingBulk))
+                .disabled(!studio.canDownload || studio.isExpandingBulk)
                 .keyboardShortcut(.return, modifiers: [.command])
             }
         }
@@ -446,12 +520,63 @@ struct StudioView: View {
         .veloraCard(padding: 14)
     }
 
+    private var downloadButtonTitle: String {
+        if studio.isExpandingBulk {
+            return "Expanding…"
+        }
+        if studio.isBatchMode {
+            let count = studio.detectedBatchURLs.count
+            return count > 0 ? "Queue \(count) URL\(count == 1 ? "" : "s")" : "Queue All URLs"
+        }
+        if let media = studio.inspectedMedia, media.isPlaylist, !media.availablePlaylistEntries.isEmpty {
+            return "Queue All \(media.availablePlaylistEntries.count) Videos"
+        }
+        if PlaylistURLDetector.isPurePlaylistURL(studio.urlInput) {
+            return "Expand & Download Playlist"
+        }
+        return "Download Now"
+    }
+
+    private func importURLListFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .commaSeparatedText]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Import URLs"
+
+        guard panel.runModal() == .OK, let fileURL = panel.url,
+              let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return
+        }
+        let extracted = YTDLPCommandBuilder.extractURLs(from: contents)
+        guard !extracted.isEmpty else {
+            studio.showToast("No valid URLs found in \(fileURL.lastPathComponent)")
+            return
+        }
+        let existing = YTDLPCommandBuilder.extractURLs(from: studio.urlInput)
+        let merged = existing + extracted.filter { !existing.contains($0) }
+        studio.isBatchMode = true
+        studio.urlInput = merged.joined(separator: "\n")
+        studio.showToast("Imported \(extracted.count) URL\(extracted.count == 1 ? "" : "s") from \(fileURL.lastPathComponent)")
+    }
+
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
         for provider in providers {
             if provider.canLoadObject(ofClass: URL.self) {
                 _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     guard let url else { return }
                     Task { @MainActor in
+                        if url.isFileURL,
+                           let text = try? String(contentsOf: url, encoding: .utf8) {
+                            let extracted = YTDLPCommandBuilder.extractURLs(from: text)
+                            if !extracted.isEmpty {
+                                studio.isBatchMode = true
+                                studio.urlInput = extracted.joined(separator: "\n")
+                                studio.showToast("Loaded \(extracted.count) URLs from \(url.lastPathComponent)")
+                                return
+                            }
+                        }
                         studio.urlInput = url.absoluteString
                         studio.isBatchMode = false
                         studio.startInspectingCurrentURL(engineManager: engineManager)
@@ -463,7 +588,13 @@ struct StudioView: View {
                 _ = provider.loadObject(ofClass: String.self) { str, _ in
                     guard let str else { return }
                     Task { @MainActor in
-                        studio.urlInput = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let extracted = YTDLPCommandBuilder.extractURLs(from: str)
+                        if extracted.count > 1 {
+                            studio.isBatchMode = true
+                            studio.urlInput = extracted.joined(separator: "\n")
+                        } else {
+                            studio.urlInput = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
                     }
                 }
                 return true

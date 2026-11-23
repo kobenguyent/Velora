@@ -1,5 +1,53 @@
 import Foundation
 
+/// A single video/audio item inside a playlist, channel, or collection returned by `--flat-playlist`.
+public struct PlaylistEntry: Sendable, Codable, Equatable, Identifiable, Hashable {
+    public let index: Int
+    public let id: String
+    public let title: String
+    public let url: String
+    public let uploader: String?
+    public let durationSeconds: Double?
+    public let thumbnailURL: String?
+    public let availability: String?
+
+    public init(
+        index: Int,
+        id: String,
+        title: String,
+        url: String,
+        uploader: String? = nil,
+        durationSeconds: Double? = nil,
+        thumbnailURL: String? = nil,
+        availability: String? = nil
+    ) {
+        self.index = index
+        self.id = id
+        self.title = title
+        self.url = url
+        self.uploader = uploader
+        self.durationSeconds = durationSeconds
+        self.thumbnailURL = thumbnailURL
+        self.availability = availability
+    }
+
+    public var formattedDuration: String? {
+        MediaInfo.formatDuration(durationSeconds)
+    }
+
+    public var isUnavailable: Bool {
+        let lowerTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowerTitle == "[private video]" || lowerTitle == "[deleted video]" || lowerTitle == "[unavailable video]" {
+            return true
+        }
+        if let availability = availability?.lowercased(),
+           availability == "private" || availability == "unavailable" {
+            return true
+        }
+        return false
+    }
+}
+
 /// Metadata extracted from a media URL using `yt-dlp --dump-single-json`.
 public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
     public let id: String
@@ -13,6 +61,8 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
     public let thumbnailURL: String?
     public let isPlaylist: Bool
     public let playlistCount: Int?
+    public let playlistEntries: [PlaylistEntry]
+    public let linkedPlaylistURL: String?
     public let formats: [MediaFormat]
 
     public init(
@@ -27,6 +77,8 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
         thumbnailURL: String? = nil,
         isPlaylist: Bool = false,
         playlistCount: Int? = nil,
+        playlistEntries: [PlaylistEntry] = [],
+        linkedPlaylistURL: String? = nil,
         formats: [MediaFormat] = []
     ) {
         self.id = id
@@ -40,11 +92,13 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
         self.thumbnailURL = thumbnailURL
         self.isPlaylist = isPlaylist
         self.playlistCount = playlistCount
+        self.playlistEntries = playlistEntries
+        self.linkedPlaylistURL = linkedPlaylistURL
         self.formats = formats
     }
 
-    public var formattedDuration: String? {
-        guard let seconds = durationSeconds, seconds > 0 else { return nil }
+    public static func formatDuration(_ seconds: Double?) -> String? {
+        guard let seconds, seconds > 0 else { return nil }
         let total = Int(seconds.rounded())
         let h = total / 3600
         let m = (total % 3600) / 60
@@ -53,6 +107,26 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
             return String(format: "%d:%02d:%02d", h, m, s)
         }
         return String(format: "%d:%02d", m, s)
+    }
+
+    public var formattedDuration: String? {
+        Self.formatDuration(durationSeconds)
+    }
+
+    public var availablePlaylistEntries: [PlaylistEntry] {
+        playlistEntries.filter { !$0.isUnavailable }
+    }
+
+    public var totalPlaylistDurationFormatted: String? {
+        let totalSeconds = playlistEntries.compactMap(\.durationSeconds).reduce(0, +)
+        guard totalSeconds > 0 else { return nil }
+        let total = Int(totalSeconds.rounded())
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        if h > 0 {
+            return "\(h)h \(m)m"
+        }
+        return "\(max(1, m))m"
     }
 
     public var formattedViewCount: String? {

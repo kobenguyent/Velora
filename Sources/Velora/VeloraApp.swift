@@ -61,10 +61,10 @@ struct VeloraApp: App {
                 .keyboardShortcut("v", modifiers: [.command, .shift])
 
                 Button("Start Download") {
-                    studioState.startDownload(downloadManager: downloadManager)
+                    studioState.startDownload(downloadManager: downloadManager, engineManager: engineManager)
                 }
                 .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(!studioState.canDownload)
+                .disabled(!studioState.canDownload || studioState.isExpandingBulk)
 
                 Divider()
 
@@ -120,8 +120,12 @@ final class StudioViewModel {
     var isInspecting: Bool = false
     var inspectionError: String?
     var isShowingFormatPicker: Bool = false
+    var isShowingPlaylistPicker: Bool = false
     var isShowingEngineSetup: Bool = false
     var isShowingSavePresetSheet: Bool = false
+    var expandPlaylistsInBatch: Bool = true
+    var isExpandingBulk: Bool = false
+    var bulkExpansionStatus: String = ""
     var toastMessage: String?
 
     private let store: VeloraStore
@@ -129,6 +133,14 @@ final class StudioViewModel {
 
     var canDownload: Bool {
         !urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var detectedBatchURLs: [String] {
+        YTDLPCommandBuilder.extractURLs(from: urlInput)
+    }
+
+    var detectedBatchPlaylistCount: Int {
+        detectedBatchURLs.filter { PlaylistURLDetector.isPurePlaylistURL($0) }.count
     }
 
     init(store: VeloraStore = VeloraStore()) {
@@ -150,22 +162,42 @@ final class StudioViewModel {
         isInspecting = false
     }
 
-    func startInspectingCurrentURL(engineManager: EngineManager) {
+    func startInspectingCurrentURL(
+        engineManager: EngineManager,
+        playlistMode: PlaylistInspectMode = .automatic
+    ) {
         inspectTask?.cancel()
         let task = Task { [weak self] in
             guard let self else { return }
-            await self.inspectCurrentURL(engineManager: engineManager)
+            await self.inspectCurrentURL(engineManager: engineManager, playlistMode: playlistMode)
         }
         inspectTask = task
     }
 
-    func inspectCurrentURL(engineManager: EngineManager) async {
+    func loadLinkedPlaylist(engineManager: EngineManager) {
+        if let linked = inspectedMedia?.linkedPlaylistURL {
+            urlInput = linked
+        }
+        startInspectingCurrentURL(engineManager: engineManager, playlistMode: .forcePlaylist)
+    }
+
+    func inspectCurrentURL(
+        engineManager: EngineManager,
+        playlistMode: PlaylistInspectMode = .automatic
+    ) async {
         let trimmed = YTDLPCommandBuilder.sanitizeURL(urlInput)
         guard !trimmed.isEmpty else { return }
 
         isInspecting = true
         inspectionError = nil
         inspectedMedia = nil
+
+        let effectiveMode: PlaylistInspectMode
+        if playlistMode == .automatic && configuration.playlistBehavior == .downloadEntirePlaylist && PlaylistURLDetector.extractLinkedPlaylistURL(from: trimmed) != nil {
+            effectiveMode = .forcePlaylist
+        } else {
+            effectiveMode = playlistMode
+        }
 
         do {
             let info = try await MediaInspector.inspect(
@@ -175,7 +207,8 @@ final class StudioViewModel {
                 proxyURL: configuration.proxyURL,
                 networkIPVersion: configuration.networkIPVersion,
                 socketTimeoutSeconds: configuration.socketTimeoutSeconds,
-                jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument
+                jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument,
+                playlistMode: effectiveMode
             )
             guard !Task.isCancelled else { return }
             inspectedMedia = info
@@ -199,43 +232,221 @@ final class StudioViewModel {
               !str.isEmpty else {
             return
         }
-        let lines = str.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        if lines.count > 1 {
+        let extracted = YTDLPCommandBuilder.extractURLs(from: str)
+        if extracted.count > 1 {
             isBatchMode = true
-            urlInput = str
+            urlInput = extracted.joined(separator: "\n")
         } else {
             isBatchMode = false
-            urlInput = str
+            urlInput = extracted.first ?? str
             startInspectingCurrentURL(engineManager: engineManager)
         }
     }
 
-    func startDownload(downloadManager: DownloadManager) {
-        let trimmed = YTDLPCommandBuilder.sanitizeURL(urlInput)
-        guard !trimmed.isEmpty else { return }
+    func queuePlaylistEntries(
+        _ entries: [PlaylistEntry],
+        mediaInfo: MediaInfo,
+        downloadManager: DownloadManager,
+        createSubfolder: Bool,
+        prefixIndex: Bool
+    ) {
+        guard !entries.isEmpty else { return }
+        let added = downloadManager.enqueuePlaylistEntries(
+            entries,
+            playlistTitle: mediaInfo.title,
+            extractor: mediaInfo.extractor,
+            baseConfiguration: configuration,
+            createSubfolder: createSubfolder,
+            prefixIndex: prefixIndex
+        )
+        showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(mediaInfo.title)\"")
+    }
 
+    func startDownload(downloadManager: DownloadManager, engineManager: EngineManager) {
+        let trimmed = YTDLPCommandBuilder.sanitizeURL(urlInput)
+        guard !trimmed.isEmpty, !isExpandingBulk else { return }
+
+        // 1. Batch Mode (or multiline paste)
         if isBatchMode || trimmed.contains("\n") {
-            let added = downloadManager.enqueueBatch(multilineInput: trimmed, configuration: configuration)
-            if added.isEmpty {
+            let urls = YTDLPCommandBuilder.extractURLs(from: trimmed)
+            guard !urls.isEmpty else {
                 showToast("No valid http/https URLs found.")
-            } else {
-                showToast("Added \(added.count) download\(added.count == 1 ? "" : "s") to queue")
+                return
+            }
+
+            let playlistURLs = expandPlaylistsInBatch
+                ? urls.filter { PlaylistURLDetector.isPurePlaylistURL($0) }
+                : []
+
+            if playlistURLs.isEmpty {
+                let added = downloadManager.enqueueURLs(urls, configuration: configuration)
+                showToast("Queued \(added.count) download\(added.count == 1 ? "" : "s")")
                 urlInput = ""
                 inspectedMedia = nil
+                return
             }
-        } else {
-            let matchesInspected: Bool = {
-                guard let media = inspectedMedia else { return false }
-                return media.webpageURL == trimmed || (!media.id.isEmpty && trimmed.contains(media.id))
-            }()
-            downloadManager.enqueue(
-                url: trimmed,
-                configuration: configuration,
-                mediaInfo: matchesInspected ? inspectedMedia : nil
-            )
-            showToast("Added to download queue")
-            configuration.customFormatID = nil
+
+            // Expand playlists in batch into individual parallel queue items
+            let singleURLs = urls.filter { !PlaylistURLDetector.isPurePlaylistURL($0) }
+            let configSnapshot = configuration
+            Task { [weak self] in
+                guard let self else { return }
+                self.isExpandingBulk = true
+                var totalQueued = 0
+
+                if !singleURLs.isEmpty {
+                    let added = downloadManager.enqueueURLs(singleURLs, configuration: configSnapshot)
+                    totalQueued += added.count
+                }
+
+                for (idx, plURL) in playlistURLs.enumerated() {
+                    self.bulkExpansionStatus = "Expanding playlist \(idx + 1) of \(playlistURLs.count)…"
+                    do {
+                        let info = try await MediaInspector.inspect(
+                            url: plURL,
+                            ytdlpPath: engineManager.ytdlpStatus.path,
+                            browserCookies: configSnapshot.browserCookies,
+                            proxyURL: configSnapshot.proxyURL,
+                            networkIPVersion: configSnapshot.networkIPVersion,
+                            socketTimeoutSeconds: configSnapshot.socketTimeoutSeconds,
+                            jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument,
+                            playlistMode: .forcePlaylist
+                        )
+                        let entries = info.availablePlaylistEntries
+                        if !entries.isEmpty {
+                            let added = downloadManager.enqueuePlaylistEntries(
+                                entries,
+                                playlistTitle: info.title,
+                                extractor: info.extractor,
+                                baseConfiguration: configSnapshot,
+                                createSubfolder: configSnapshot.createPlaylistSubfolder,
+                                prefixIndex: true
+                            )
+                            totalQueued += added.count
+                        } else {
+                            // Fallback to direct playlist download if flat expansion returned no entries
+                            var fallbackConfig = configSnapshot
+                            fallbackConfig.playlistBehavior = .downloadEntirePlaylist
+                            if downloadManager.enqueue(url: plURL, configuration: fallbackConfig) != nil {
+                                totalQueued += 1
+                            }
+                        }
+                    } catch {
+                        // Fallback to direct yt-dlp playlist execution so nothing is dropped
+                        var fallbackConfig = configSnapshot
+                        fallbackConfig.playlistBehavior = .downloadEntirePlaylist
+                        if downloadManager.enqueue(url: plURL, configuration: fallbackConfig) != nil {
+                            totalQueued += 1
+                        }
+                    }
+                }
+
+                self.isExpandingBulk = false
+                self.bulkExpansionStatus = ""
+                self.urlInput = ""
+                self.inspectedMedia = nil
+                self.showToast("Queued \(totalQueued) download\(totalQueued == 1 ? "" : "s") across bulk batch")
+            }
+            return
         }
+
+        // 2. Single URL Mode: already-inspected playlist -> queue all available entries concurrently
+        if let media = inspectedMedia,
+           media.isPlaylist,
+           !media.playlistEntries.isEmpty,
+           (media.webpageURL == trimmed || trimmed.contains(media.id)) {
+            let entries: [PlaylistEntry]
+            let rangeText = configuration.playlistItems.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rangeText.isEmpty {
+                let allowed = PlaylistURLDetector.parseSelectionRange(rangeText, maxIndex: media.playlistEntries.count)
+                entries = media.availablePlaylistEntries.filter { allowed.contains($0.index) }
+            } else {
+                entries = media.availablePlaylistEntries
+            }
+            if !entries.isEmpty {
+                queuePlaylistEntries(
+                    entries,
+                    mediaInfo: media,
+                    downloadManager: downloadManager,
+                    createSubfolder: configuration.createPlaylistSubfolder,
+                    prefixIndex: true
+                )
+                return
+            }
+        }
+
+        // 3. Single URL Mode: uninspected pure playlist URL -> expand automatically into parallel queue tasks
+        let shouldAutoExpandPlaylist = PlaylistURLDetector.isPurePlaylistURL(trimmed) ||
+            (configuration.playlistBehavior == .downloadEntirePlaylist && PlaylistURLDetector.extractLinkedPlaylistURL(from: trimmed) != nil)
+
+        if shouldAutoExpandPlaylist {
+            let configSnapshot = configuration
+            Task { [weak self] in
+                guard let self else { return }
+                self.isExpandingBulk = true
+                self.bulkExpansionStatus = "Expanding playlist videos for parallel download…"
+                do {
+                    let info = try await MediaInspector.inspect(
+                        url: trimmed,
+                        ytdlpPath: engineManager.ytdlpStatus.path,
+                        browserCookies: configSnapshot.browserCookies,
+                        proxyURL: configSnapshot.proxyURL,
+                        networkIPVersion: configSnapshot.networkIPVersion,
+                        socketTimeoutSeconds: configSnapshot.socketTimeoutSeconds,
+                        jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument,
+                        playlistMode: .forcePlaylist
+                    )
+                    self.inspectedMedia = info
+                    let rangeText = configSnapshot.playlistItems.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let entries: [PlaylistEntry]
+                    if !rangeText.isEmpty {
+                        let allowed = PlaylistURLDetector.parseSelectionRange(rangeText, maxIndex: info.playlistEntries.count)
+                        entries = info.availablePlaylistEntries.filter { allowed.contains($0.index) }
+                    } else {
+                        entries = info.availablePlaylistEntries
+                    }
+
+                    if !entries.isEmpty {
+                        let added = downloadManager.enqueuePlaylistEntries(
+                            entries,
+                            playlistTitle: info.title,
+                            extractor: info.extractor,
+                            baseConfiguration: configSnapshot,
+                            createSubfolder: configSnapshot.createPlaylistSubfolder,
+                            prefixIndex: true
+                        )
+                        self.showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(info.title)\"")
+                    } else {
+                        var fallbackConfig = configSnapshot
+                        fallbackConfig.playlistBehavior = .downloadEntirePlaylist
+                        downloadManager.enqueue(url: trimmed, configuration: fallbackConfig, mediaInfo: info)
+                        self.showToast("Added playlist to download queue")
+                    }
+                } catch {
+                    // Graceful fallback to direct yt-dlp --yes-playlist
+                    var fallbackConfig = configSnapshot
+                    fallbackConfig.playlistBehavior = .downloadEntirePlaylist
+                    downloadManager.enqueue(url: trimmed, configuration: fallbackConfig)
+                    self.showToast("Added playlist to download queue")
+                }
+                self.isExpandingBulk = false
+                self.bulkExpansionStatus = ""
+            }
+            return
+        }
+
+        // 4. Standard single video download
+        let matchesInspected: Bool = {
+            guard let media = inspectedMedia else { return false }
+            return media.webpageURL == trimmed || (!media.id.isEmpty && trimmed.contains(media.id))
+        }()
+        downloadManager.enqueue(
+            url: trimmed,
+            configuration: configuration,
+            mediaInfo: matchesInspected ? inspectedMedia : nil
+        )
+        showToast("Added to download queue")
+        configuration.customFormatID = nil
     }
 
     func showToast(_ message: String) {

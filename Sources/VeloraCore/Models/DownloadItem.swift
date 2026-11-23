@@ -53,6 +53,11 @@ public struct DownloadTaskItem: Identifiable, Codable, Sendable, Equatable {
     public var outputFilePath: String?
     public var errorMessage: String?
     public var logs: [String]
+    public var batchID: UUID?
+    public var batchName: String?
+    public var playlistIndex: Int?
+    public var playlistTotal: Int?
+    public var completedFileCount: Int
     public let createdAt: Date
     public var completedAt: Date?
 
@@ -67,6 +72,10 @@ public struct DownloadTaskItem: Identifiable, Codable, Sendable, Equatable {
         status: DownloadStatus = .queued,
         progress: Double = 0,
         statusDetail: String = "Waiting in queue",
+        batchID: UUID? = nil,
+        batchName: String? = nil,
+        playlistIndex: Int? = nil,
+        playlistTotal: Int? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -80,6 +89,11 @@ public struct DownloadTaskItem: Identifiable, Codable, Sendable, Equatable {
         self.progress = progress
         self.statusDetail = statusDetail
         self.logs = []
+        self.batchID = batchID
+        self.batchName = batchName
+        self.playlistIndex = playlistIndex
+        self.playlistTotal = playlistTotal
+        self.completedFileCount = 0
         self.createdAt = createdAt
     }
 

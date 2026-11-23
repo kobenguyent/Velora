@@ -13,6 +13,31 @@ public enum YTDLPCommandBuilder {
         return cleaned
     }
 
+    /// Extracts, sanitizes, and deduplicates `http://` and `https://` URLs from pasted text, newline lists, or CSVs.
+    public static func extractURLs(from rawText: String) -> [String] {
+        var seen: Set<String> = []
+        var ordered: [String] = []
+
+        for rawLine in rawText.components(separatedBy: .newlines) {
+            let trimmedLine = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedLine.isEmpty || trimmedLine.hasPrefix("#") { continue }
+
+            // Support plain lines, comma/tab-separated lines, or lines containing inline links
+            let candidates = trimmedLine.components(separatedBy: CharacterSet.whitespaces.union(CharacterSet(charactersIn: ",;\t")))
+            for candidate in candidates {
+                let cleaned = sanitizeURL(candidate).trimmingCharacters(in: CharacterSet(charactersIn: "(),[]"))
+                guard cleaned.hasPrefix("http://") || cleaned.hasPrefix("https://"),
+                      URL(string: cleaned) != nil else {
+                    continue
+                }
+                if seen.insert(cleaned).inserted {
+                    ordered.append(cleaned)
+                }
+            }
+        }
+        return ordered
+    }
+
     public static func buildArguments(
         url: String,
         configuration: DownloadConfiguration,
@@ -128,6 +153,7 @@ public enum YTDLPCommandBuilder {
             args.append("--no-playlist")
         case .downloadEntirePlaylist:
             args.append("--yes-playlist")
+            args.append("--ignore-errors")
             let items = configuration.playlistItems.trimmingCharacters(in: .whitespacesAndNewlines)
             if !items.isEmpty {
                 args.append(contentsOf: ["--playlist-items", items])

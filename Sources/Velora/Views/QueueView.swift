@@ -2,26 +2,89 @@ import AppKit
 import SwiftUI
 import VeloraCore
 
+private enum QueueFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case active = "Active"
+    case queued = "Queued"
+    case completed = "Completed"
+    case failed = "Failed"
+
+    var id: String { rawValue }
+}
+
 struct QueueView: View {
-    let downloadManager: DownloadManager
+    @Bindable var downloadManager: DownloadManager
     @State private var expandedLogs: Set<UUID> = []
+    @State private var filter: QueueFilter = .all
+    @State private var searchQuery: String = ""
+
+    private var filteredItems: [DownloadTaskItem] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return downloadManager.queue.filter { item in
+            let matchesFilter: Bool = switch filter {
+            case .all: true
+            case .active: item.status.isActive
+            case .queued: item.status == .queued
+            case .completed: item.status == .completed
+            case .failed: item.status == .failed || item.status == .cancelled
+            }
+            guard matchesFilter else { return false }
+            guard !query.isEmpty else { return true }
+            return item.title.lowercased().contains(query) ||
+                (item.batchName?.lowercased().contains(query) ?? false) ||
+                item.url.lowercased().contains(query)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
+            HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Download Queue")
                         .font(.title2.weight(.bold))
-                    Text("\(downloadManager.activeCount) active · \(downloadManager.queuedCount) queued · \(downloadManager.queue.count) total")
+                    Text("\(downloadManager.activeCount) active · \(downloadManager.queuedCount) queued · \(downloadManager.completedCount) completed · \(downloadManager.queue.count) total")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
 
-                if downloadManager.hasActiveDownloads {
-                    Button("Cancel All Active", role: .destructive) {
+                Stepper(
+                    "Parallel: \(downloadManager.maxConcurrentDownloads)",
+                    value: $downloadManager.maxConcurrentDownloads,
+                    in: 1...8
+                )
+                .font(.caption.weight(.medium))
+                .frame(width: 132)
+
+                if downloadManager.hasPendingOrActiveDownloads {
+                    Button {
+                        if downloadManager.isQueuePaused {
+                            downloadManager.resumeQueue()
+                        } else {
+                            downloadManager.pauseQueue()
+                        }
+                    } label: {
+                        Label(
+                            downloadManager.isQueuePaused ? "Resume Queue" : "Pause Queue",
+                            systemImage: downloadManager.isQueuePaused ? "play.fill" : "pause.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if downloadManager.failedCount > 0 {
+                    Button {
+                        downloadManager.retryAllFailed()
+                    } label: {
+                        Label("Retry Failed (\(downloadManager.failedCount))", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if downloadManager.hasPendingOrActiveDownloads {
+                    Button("Cancel All", role: .destructive) {
                         downloadManager.cancelAllActive()
                     }
                     .buttonStyle(.bordered)
@@ -34,7 +97,32 @@ struct QueueView: View {
                 .disabled(!downloadManager.queue.contains(where: { $0.status.isTerminal }))
             }
             .padding(.horizontal, 22)
-            .padding(.vertical, 16)
+            .padding(.vertical, 14)
+
+            if downloadManager.queue.count > 1 {
+                bulkProgressStrip
+            }
+
+            if !downloadManager.queue.isEmpty {
+                HStack(spacing: 12) {
+                    Picker("Filter", selection: $filter) {
+                        ForEach(QueueFilter.allCases) { f in
+                            Text(f.rawValue).tag(f)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 380)
+
+                    Spacer()
+
+                    TextField("Search queue or playlist…", text: $searchQuery)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 230)
+                }
+                .padding(.horizontal, 22)
+                .padding(.bottom, 10)
+            }
 
             Divider()
 
@@ -42,12 +130,18 @@ struct QueueView: View {
                 ContentUnavailableView(
                     "Your Queue Is Clear",
                     systemImage: "arrow.down.circle.dotted",
-                    description: Text("Paste any video or playlist link in Studio to start downloading.")
+                    description: Text("Paste any video, playlist, or bulk URL list in Studio to start downloading.")
+                )
+            } else if filteredItems.isEmpty {
+                ContentUnavailableView(
+                    "No Matching Downloads",
+                    systemImage: "line.3.horizontal.decrease.circle",
+                    description: Text("Try switching the queue filter or clearing your search query.")
                 )
             } else {
                 ScrollView {
                     LazyVStack(spacing: 12) {
-                        ForEach(downloadManager.queue) { item in
+                        ForEach(filteredItems) { item in
                             QueueItemCard(
                                 item: item,
                                 isLogExpanded: expandedLogs.contains(item.id),
@@ -70,6 +164,28 @@ struct QueueView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
+
+    private var bulkProgressStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: downloadManager.isQueuePaused ? "pause.circle.fill" : "square.stack.3d.down.right.fill")
+                        .foregroundStyle(downloadManager.isQueuePaused ? VeloraTheme.amber : VeloraTheme.cyan)
+                    Text(downloadManager.isQueuePaused ? "Bulk Queue Paused (active items will finish)" : "Bulk Progress")
+                        .font(.caption.weight(.semibold))
+                }
+                Spacer()
+                Text("\(downloadManager.completedCount) of \(downloadManager.queue.filter { $0.status != .cancelled }.count) finished (\(Int((downloadManager.overallQueueProgress * 100).rounded()))%)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: downloadManager.overallQueueProgress)
+                .tint(downloadManager.overallQueueProgress >= 1.0 ? VeloraTheme.emerald : VeloraTheme.cyan)
+        }
+        .padding(.horizontal, 22)
+        .padding(.bottom, 10)
+    }
 }
 
 private struct QueueItemCard: View {
@@ -89,11 +205,18 @@ private struct QueueItemCard: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
+                        if let index = item.playlistIndex, item.batchName != nil {
+                            Text(String(format: "#%02d", index))
+                                .font(.system(.caption, design: .monospaced, weight: .bold))
+                                .foregroundStyle(VeloraTheme.cyan)
+                        }
                         Text(item.title)
                             .font(.headline)
                             .lineLimit(1)
                         VeloraBadge(text: item.configuration.summaryBadge, color: VeloraTheme.violet)
-                        if let extractor = item.extractor {
+                        if let batchName = item.batchName {
+                            VeloraBadge(text: batchName, color: VeloraTheme.cyan, icon: "list.bullet.rectangle")
+                        } else if let extractor = item.extractor {
                             VeloraBadge(text: extractor, color: .secondary)
                         }
                     }
