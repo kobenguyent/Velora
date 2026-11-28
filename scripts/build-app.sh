@@ -79,12 +79,31 @@ rm -rf "$(dirname "$ICONSET_DIR")"
 
 # 3. Stamp Info.plist from template
 INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
-sed \
-    -e "s|__BUNDLE_ID__|$BUNDLE_ID|g" \
-    -e "s|__VERSION__|$VERSION|g" \
-    -e "s|__BUILD_NUMBER__|$BUILD_NUMBER|g" \
-    -e "s|__GITHUB_REPO__|$GITHUB_REPO|g" \
-    "$ROOT_DIR/Resources/Info.plist.template" > "$INFO_PLIST"
+BUNDLE_ID="$BUNDLE_ID" \
+VERSION="$VERSION" \
+BUILD_NUMBER="$BUILD_NUMBER" \
+GITHUB_REPO="$GITHUB_REPO" \
+TEMPLATE_PATH="$ROOT_DIR/Resources/Info.plist.template" \
+OUTPUT_PLIST_PATH="$INFO_PLIST" \
+python3 - <<'EOF'
+import os
+from xml.sax.saxutils import escape
+
+with open(os.environ["TEMPLATE_PATH"], "r", encoding="utf-8") as fh:
+    content = fh.read()
+
+replacements = {
+    "__BUNDLE_ID__": escape(os.environ["BUNDLE_ID"]),
+    "__VERSION__": escape(os.environ["VERSION"]),
+    "__BUILD_NUMBER__": escape(os.environ["BUILD_NUMBER"]),
+    "__GITHUB_REPO__": escape(os.environ["GITHUB_REPO"]),
+}
+for placeholder, value in replacements.items():
+    content = content.replace(placeholder, value)
+
+with open(os.environ["OUTPUT_PLIST_PATH"], "w", encoding="utf-8") as fh:
+    fh.write(content)
+EOF
 
 plutil -lint "$INFO_PLIST"
 
