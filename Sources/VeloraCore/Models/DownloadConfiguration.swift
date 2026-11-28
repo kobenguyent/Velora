@@ -244,7 +244,7 @@ public enum BrowserCookiesSource: String, CaseIterable, Codable, Sendable, Ident
     public var ytdlpIdentifier: String? {
         switch self {
         case .none: nil
-        case .arc: "chrome" // Arc uses Chromium profile; custom path can be passed in extra args
+        case .arc: "chrome:~/Library/Application Support/Arc/User Data"
         default: rawValue
         }
     }
@@ -368,6 +368,9 @@ public struct DownloadConfiguration: Codable, Sendable, Equatable {
     public var rateLimit: String = ""
     public var proxyURL: String = ""
     public var browserCookies: BrowserCookiesSource = .none
+    public var cookieFilePath: String = ""
+    public var autoRetryCount: Int = 3
+    public var resumePartialDownloads: Bool = true
     public var extraArguments: String = ""
 
     public init() {}
@@ -410,7 +413,47 @@ public struct DownloadConfiguration: Codable, Sendable, Equatable {
         rateLimit = try c.decodeIfPresent(String.self, forKey: .rateLimit) ?? defaults.rateLimit
         proxyURL = try c.decodeIfPresent(String.self, forKey: .proxyURL) ?? defaults.proxyURL
         browserCookies = try c.decodeIfPresent(BrowserCookiesSource.self, forKey: .browserCookies) ?? defaults.browserCookies
+        cookieFilePath = try c.decodeIfPresent(String.self, forKey: .cookieFilePath) ?? defaults.cookieFilePath
+        let rawRetryCount = try c.decodeIfPresent(Int.self, forKey: .autoRetryCount) ?? defaults.autoRetryCount
+        autoRetryCount = min(10, max(0, rawRetryCount))
+        resumePartialDownloads = try c.decodeIfPresent(Bool.self, forKey: .resumePartialDownloads) ?? defaults.resumePartialDownloads
         extraArguments = try c.decodeIfPresent(String.self, forKey: .extraArguments) ?? defaults.extraArguments
+    }
+
+    public var activeModifierSummaries: [String] {
+        var summaries: [String] = []
+        if subtitleMode != .off {
+            summaries.append("Subs")
+        }
+        if sponsorBlock != .off {
+            summaries.append("SponsorBlock")
+        }
+        if clipEnabled {
+            summaries.append("Clip")
+        }
+        if playlistBehavior == .downloadEntirePlaylist {
+            summaries.append("Playlist")
+        }
+        if browserCookies != .none {
+            summaries.append("\(browserCookies.displayName) Cookies")
+        }
+        if !cookieFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            summaries.append("cookies.txt")
+        }
+        if !proxyURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            summaries.append("Proxy")
+        }
+        if !rateLimit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            summaries.append("Speed Cap")
+        }
+        if !extraArguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            summaries.append("Extra Args")
+        }
+        if let customFormatID = customFormatID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !customFormatID.isEmpty {
+            summaries.append("Stream #\(customFormatID)")
+        }
+        return summaries
     }
 
     public static func defaultOutputDirectoryPath() -> String {

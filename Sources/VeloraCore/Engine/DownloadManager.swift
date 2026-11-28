@@ -1,14 +1,104 @@
 import AppKit
 import Foundation
 
+private final class DownloadOutputCoalescer: @unchecked Sendable {
+    private let ioQueue: DispatchQueue
+    private let onFlushBatch: @Sendable ([(YTDLPOutputEvent, String)]) -> Void
+    private let minInterval: Duration = .milliseconds(100)
+
+    private var lastProgressEmittedAt: ContinuousClock.Instant?
+    private var pendingProgress: (YTDLPOutputEvent, String)?
+    private var trailingTimerScheduled = false
+    private var isClosed = false
+
+    init(
+        ioQueue: DispatchQueue,
+        onFlushBatch: @escaping @Sendable ([(YTDLPOutputEvent, String)]) -> Void
+    ) {
+        self.ioQueue = ioQueue
+        self.onFlushBatch = onFlushBatch
+    }
+
+    func process(lines: [String]) {
+        guard !isClosed else { return }
+        var batch: [(YTDLPOutputEvent, String)] = []
+        let now = ContinuousClock.now
+
+        for rawLine in lines {
+            let event = YTDLPOutputParser.parse(line: rawLine)
+            if case .progress = event {
+                if let last = lastProgressEmittedAt, (now - last) < minInterval {
+                    pendingProgress = (event, rawLine)
+                    scheduleTrailingTimerIfNeeded()
+                } else {
+                    pendingProgress = nil
+                    lastProgressEmittedAt = now
+                    batch.append((event, rawLine))
+                }
+            } else {
+                if let pending = pendingProgress {
+                    pendingProgress = nil
+                    lastProgressEmittedAt = now
+                    batch.append(pending)
+                }
+                batch.append((event, rawLine))
+            }
+        }
+
+        if !batch.isEmpty {
+            onFlushBatch(batch)
+        }
+    }
+
+    func takeRemainingAndClose(trailingLines: [String]) -> [(YTDLPOutputEvent, String)] {
+        isClosed = true
+        var batch: [(YTDLPOutputEvent, String)] = []
+        if let pending = pendingProgress {
+            pendingProgress = nil
+            batch.append(pending)
+        }
+        for rawLine in trailingLines {
+            batch.append((YTDLPOutputParser.parse(line: rawLine), rawLine))
+        }
+        return batch
+    }
+
+    private func scheduleTrailingTimerIfNeeded() {
+        guard !trailingTimerScheduled, !isClosed else { return }
+        trailingTimerScheduled = true
+        ioQueue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            guard let self else { return }
+            self.trailingTimerScheduled = false
+            guard !self.isClosed, let pending = self.pendingProgress else { return }
+            self.pendingProgress = nil
+            self.lastProgressEmittedAt = ContinuousClock.now
+            self.onFlushBatch([pending])
+        }
+    }
+}
+
 /// Coordinates concurrent `yt-dlp` download processes, bulk/playlist batches, queue state, live logs, history, and presets.
 @MainActor
 @Observable
 public final class DownloadManager {
-    public private(set) var queue: [DownloadTaskItem] = []
+    private struct RunningProcessEntry {
+        let process: Process
+        let pid: pid_t
+    }
+
+    public private(set) var queue: [DownloadTask] = []
     public private(set) var history: [DownloadHistoryEntry] = []
     public private(set) var customPresets: [DownloadPreset] = []
     public private(set) var isQueuePaused: Bool = false
+
+    public private(set) var activeCount: Int = 0
+    public private(set) var queuedCount: Int = 0
+    public private(set) var pausedCount: Int = 0
+    public private(set) var completedCount: Int = 0
+    public private(set) var failedCount: Int = 0
+
+    public var onTaskFinished: (@MainActor (DownloadTask, Bool) -> Void)?
+    public var onQueueChanged: (@MainActor () -> Void)?
 
     public var maxConcurrentDownloads: Int {
         didSet {
@@ -30,7 +120,8 @@ public final class DownloadManager {
 
     private let engineManager: EngineManager
     private let store: VeloraStore
-    private var runningProcesses: [UUID: Process] = [:]
+    private var runningProcesses: [UUID: RunningProcessEntry] = [:]
+    private var videoOnlyFormatTaskIDs: Set<UUID> = []
 
     private enum Keys {
         static let maxConcurrentDownloads = "velora.downloads.maxConcurrent"
@@ -39,22 +130,6 @@ public final class DownloadManager {
 
     public var allPresets: [DownloadPreset] {
         DownloadPreset.builtInPresets + customPresets
-    }
-
-    public var activeCount: Int {
-        queue.filter { $0.status.isActive }.count
-    }
-
-    public var queuedCount: Int {
-        queue.filter { $0.status == .queued }.count
-    }
-
-    public var completedCount: Int {
-        queue.filter { $0.status == .completed }.count
-    }
-
-    public var failedCount: Int {
-        queue.filter { $0.status == .failed }.count
     }
 
     public var hasActiveDownloads: Bool {
@@ -94,24 +169,47 @@ public final class DownloadManager {
 
         self.history = store.loadHistory()
         self.customPresets = store.loadCustomPresets()
+
+        let persisted = store.loadQueue()
+        self.isQueuePaused = persisted.isQueuePaused
+        self.queue = persisted.items.map(DownloadTask.init(snapshot:))
+        recalculateCounters()
+    }
+
+    /// Starts any restored `.queued` tasks once `engineManager.refresh()` completes (leaving `.paused` tasks paused).
+    public func restorePendingQueueAfterEngineReady() {
+        pumpQueue()
+    }
+
+    public func flushPersistence() async {
+        await store.flush()
     }
 
     // MARK: - Enqueue & Bulk Operations
+
+    public func hasPendingOrActiveDownload(for rawURL: String) -> Bool {
+        let normalized = YTDLPCommandBuilder.sanitizeURL(rawURL)
+        guard !normalized.isEmpty else { return false }
+        return queue.contains { task in
+            task.url == normalized && !task.status.isTerminal
+        }
+    }
 
     @discardableResult
     public func enqueue(
         url rawURL: String,
         configuration: DownloadConfiguration,
         mediaInfo: MediaInfo? = nil,
+        customFormatIsVideoOnly: Bool = false,
         batchID: UUID? = nil,
         batchName: String? = nil,
         playlistIndex: Int? = nil,
         playlistTotal: Int? = nil
-    ) -> DownloadTaskItem? {
+    ) -> DownloadTask? {
         let trimmed = YTDLPCommandBuilder.sanitizeURL(rawURL)
-        guard !trimmed.isEmpty else { return nil }
+        guard YTDLPCommandBuilder.isValidMediaURL(trimmed) else { return nil }
 
-        let item = DownloadTaskItem(
+        let task = DownloadTask(
             url: trimmed,
             title: mediaInfo?.title,
             uploader: mediaInfo?.uploader,
@@ -123,13 +221,18 @@ public final class DownloadManager {
             playlistIndex: playlistIndex,
             playlistTotal: playlistTotal
         )
-        queue.insert(item, at: 0)
+        if customFormatIsVideoOnly {
+            videoOnlyFormatTaskIDs.insert(task.id)
+        }
+        queue.insert(task, at: 0)
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
-        return item
+        return task
     }
 
-    /// Enqueues selected entries from a playlist/channel as individual concurrent downloads,
-    /// optionally saving them into a dedicated playlist subfolder with zero-padded track numbering.
+    /// Enqueues selected entries from a playlist/channel in natural `#01 -> #N` top-to-bottom order
+    /// while executing them in FIFO order (`#01` first).
     @discardableResult
     public func enqueuePlaylistEntries(
         _ entries: [PlaylistEntry],
@@ -138,23 +241,25 @@ public final class DownloadManager {
         baseConfiguration: DownloadConfiguration,
         createSubfolder: Bool = true,
         prefixIndex: Bool = true
-    ) -> [DownloadTaskItem] {
-        guard !entries.isEmpty else { return [] }
+    ) -> [DownloadTask] {
+        let validEntries = entries.filter { YTDLPCommandBuilder.isValidMediaURL($0.url) }
+        guard !validEntries.isEmpty else { return [] }
 
         let batchID = UUID()
+        let batchCreatedAt = Date()
         let safeFolderName = PlaylistURLDetector.sanitizeFolderName(playlistTitle)
         let expandedBase = (baseConfiguration.outputDirectoryPath as NSString).expandingTildeInPath
         let destinationDir: String = createSubfolder
             ? URL(fileURLWithPath: expandedBase, isDirectory: true).appendingPathComponent(safeFolderName, isDirectory: true).path
             : baseConfiguration.outputDirectoryPath
 
-        let maxIndex = entries.map(\.index).max() ?? entries.count
+        let maxIndex = validEntries.map(\.index).max() ?? validEntries.count
         let padWidth = maxIndex >= 100 ? 3 : 2
 
-        var created: [DownloadTaskItem] = []
-        // Insert in reverse order at index 0? No: pumpQueue starts FIFO from the tail of `queue` (reversed indices).
-        // Inserting item 1 first, then item 2 at index 0 puts item 1 at the tail so item 1 starts FIRST!
-        for entry in entries {
+        var created: [DownloadTask] = []
+        created.reserveCapacity(validEntries.count)
+
+        for entry in validEntries {
             var itemConfig = baseConfiguration
             itemConfig.playlistBehavior = .singleVideoOnly
             itemConfig.playlistItems = ""
@@ -169,8 +274,8 @@ public final class DownloadManager {
                 itemConfig.customFilenameTemplate = "\(padded) - \(baseTemplate)"
             }
 
-            let item = DownloadTaskItem(
-                url: entry.url,
+            let task = DownloadTask(
+                url: YTDLPCommandBuilder.sanitizeURL(entry.url),
                 title: entry.title,
                 uploader: entry.uploader,
                 extractor: extractor,
@@ -179,12 +284,15 @@ public final class DownloadManager {
                 batchID: batchID,
                 batchName: playlistTitle,
                 playlistIndex: entry.index,
-                playlistTotal: entries.count
+                playlistTotal: validEntries.count,
+                createdAt: batchCreatedAt
             )
-            queue.insert(item, at: 0)
-            created.append(item)
+            created.append(task)
         }
 
+        queue.insert(contentsOf: created, at: 0)
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
         return created
     }
@@ -194,7 +302,7 @@ public final class DownloadManager {
         multilineInput: String,
         configuration: DownloadConfiguration,
         batchName: String? = nil
-    ) -> [DownloadTaskItem] {
+    ) -> [DownloadTask] {
         let urls = YTDLPCommandBuilder.extractURLs(from: multilineInput)
         return enqueueURLs(urls, configuration: configuration, batchName: batchName)
     }
@@ -204,24 +312,35 @@ public final class DownloadManager {
         _ urls: [String],
         configuration: DownloadConfiguration,
         batchName: String? = nil
-    ) -> [DownloadTaskItem] {
-        guard !urls.isEmpty else { return [] }
-        let batchID = urls.count > 1 ? UUID() : nil
-        let effectiveBatchName = batchName ?? (urls.count > 1 ? "Bulk Batch (\(urls.count))" : nil)
+    ) -> [DownloadTask] {
+        let validURLs = urls
+            .map(YTDLPCommandBuilder.sanitizeURL)
+            .filter(YTDLPCommandBuilder.isValidMediaURL)
+        guard !validURLs.isEmpty else { return [] }
 
-        var added: [DownloadTaskItem] = []
-        for (idx, url) in urls.enumerated() {
-            let item = DownloadTaskItem(
+        let batchID = validURLs.count > 1 ? UUID() : nil
+        let batchCreatedAt = Date()
+        let effectiveBatchName = batchName ?? (validURLs.count > 1 ? "Bulk Batch (\(validURLs.count))" : nil)
+
+        var added: [DownloadTask] = []
+        added.reserveCapacity(validURLs.count)
+
+        for (idx, url) in validURLs.enumerated() {
+            let task = DownloadTask(
                 url: url,
                 configuration: configuration,
                 batchID: batchID,
                 batchName: effectiveBatchName,
-                playlistIndex: urls.count > 1 ? idx + 1 : nil,
-                playlistTotal: urls.count > 1 ? urls.count : nil
+                playlistIndex: validURLs.count > 1 ? idx + 1 : nil,
+                playlistTotal: validURLs.count > 1 ? validURLs.count : nil,
+                createdAt: batchCreatedAt
             )
-            queue.insert(item, at: 0)
-            added.append(item)
+            added.append(task)
         }
+
+        queue.insert(contentsOf: added, at: 0)
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
         return added
     }
@@ -230,95 +349,165 @@ public final class DownloadManager {
 
     public func pauseQueue() {
         isQueuePaused = true
+        persistQueue()
     }
 
     public func resumeQueue() {
         isQueuePaused = false
+        persistQueue()
+        pumpQueue()
+    }
+
+    public func pause(id: UUID) {
+        guard let task = queue.first(where: { $0.id == id }) else { return }
+        guard task.status.isActive || task.status == .queued else { return }
+
+        task.status = .paused
+        task.statusDetail = "Paused — Resume to continue"
+        task.speedText = nil
+        task.etaText = nil
+        task.logBuffer.append("— Paused by user —")
+
+        if let running = runningProcesses.removeValue(forKey: id) {
+            ProcessSupervisor.terminateProcessGroup(pid: running.pid, process: running.process)
+        }
+
+        recalculateCounters()
+        persistQueue()
+        pumpQueue()
+    }
+
+    public func resume(id: UUID) {
+        guard let task = queue.first(where: { $0.id == id }) else { return }
+        guard task.status.isResumable else { return }
+
+        task.configuration.resumePartialDownloads = true
+        task.status = .queued
+        task.statusDetail = "Queued to resume"
+        task.errorMessage = nil
+        task.speedText = nil
+        task.etaText = nil
+        task.logBuffer.append("— Resuming download —")
+
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
     }
 
     public func cancel(id: UUID) {
-        if let process = runningProcesses[id] {
-            process.terminate()
-            runningProcesses.removeValue(forKey: id)
+        if let task = queue.first(where: { $0.id == id }) {
+            task.status = .cancelled
+            task.statusDetail = "Cancelled by user"
+            task.speedText = nil
+            task.etaText = nil
         }
-        guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
-        queue[idx].status = .cancelled
-        queue[idx].statusDetail = "Cancelled by user"
-        queue[idx].speedText = nil
-        queue[idx].etaText = nil
+        if let running = runningProcesses.removeValue(forKey: id) {
+            ProcessSupervisor.terminateProcessGroup(pid: running.pid, process: running.process)
+        }
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
     }
 
     /// Cancels all currently running downloads AND any waiting queued items.
     public func cancelAllActive() {
-        // First mark all queued items cancelled so termination handlers do not launch them.
-        for idx in queue.indices where queue[idx].status == .queued || queue[idx].status.isActive {
-            queue[idx].status = .cancelled
-            queue[idx].statusDetail = "Cancelled"
-            queue[idx].speedText = nil
-            queue[idx].etaText = nil
+        for task in queue where task.status == .queued || task.status.isActive {
+            task.status = .cancelled
+            task.statusDetail = "Cancelled"
+            task.speedText = nil
+            task.etaText = nil
         }
-        for (_, process) in runningProcesses {
-            process.terminate()
+        for (_, running) in runningProcesses {
+            ProcessSupervisor.terminateProcessGroup(pid: running.pid, process: running.process)
+        }
+        runningProcesses.removeAll()
+        recalculateCounters()
+        persistQueue()
+    }
+
+    /// Gracefully transitions active downloads to `.paused`, persists `queue.json`, and terminates all process groups on app quit.
+    public func terminateAllOnQuit() {
+        for task in queue where task.status.isActive {
+            task.status = .paused
+            task.statusDetail = "Interrupted — Resume to continue"
+            task.speedText = nil
+            task.etaText = nil
+        }
+        recalculateCounters()
+        persistQueue()
+
+        for (_, running) in runningProcesses {
+            ProcessSupervisor.terminateProcessGroup(pid: running.pid, process: running.process, graceSeconds: 0.5)
         }
         runningProcesses.removeAll()
     }
 
     public func retry(id: UUID) {
-        guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
-        guard queue[idx].status.isTerminal else { return }
-        queue[idx].status = .queued
-        queue[idx].progress = 0
-        queue[idx].statusDetail = "Queued for retry"
-        queue[idx].errorMessage = nil
-        queue[idx].speedText = nil
-        queue[idx].etaText = nil
-        queue[idx].logs.append("— Retrying download —")
+        guard let task = queue.first(where: { $0.id == id }) else { return }
+        guard task.status.isTerminal else { return }
+
+        task.status = .queued
+        task.progress = 0
+        task.statusDetail = "Queued for retry"
+        task.errorMessage = nil
+        task.speedText = nil
+        task.etaText = nil
+        task.logBuffer.append("— Retrying download —")
+
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
     }
 
     public func retryAllFailed() {
         var didRequeue = false
-        for idx in queue.indices where queue[idx].status == .failed || queue[idx].status == .cancelled {
-            queue[idx].status = .queued
-            queue[idx].progress = 0
-            queue[idx].statusDetail = "Queued for retry"
-            queue[idx].errorMessage = nil
-            queue[idx].speedText = nil
-            queue[idx].etaText = nil
-            queue[idx].logs.append("— Retrying download —")
+        for task in queue where task.status == .failed || task.status == .cancelled {
+            task.status = .queued
+            task.progress = 0
+            task.statusDetail = "Queued for retry"
+            task.errorMessage = nil
+            task.speedText = nil
+            task.etaText = nil
+            task.logBuffer.append("— Retrying download —")
             didRequeue = true
         }
         if didRequeue {
             isQueuePaused = false
+            recalculateCounters()
+            persistQueue()
             pumpQueue()
         }
     }
 
     public func remove(id: UUID) {
-        if let process = runningProcesses[id] {
-            process.terminate()
-            runningProcesses.removeValue(forKey: id)
+        if let running = runningProcesses.removeValue(forKey: id) {
+            ProcessSupervisor.terminateProcessGroup(pid: running.pid, process: running.process)
         }
+        videoOnlyFormatTaskIDs.remove(id)
         queue.removeAll { $0.id == id }
+        recalculateCounters()
+        persistQueue()
         pumpQueue()
     }
 
     public func clearFinished() {
+        let removedIDs = Set(queue.filter { $0.status.isTerminal }.map(\.id))
+        videoOnlyFormatTaskIDs.subtract(removedIDs)
         queue.removeAll { $0.status.isTerminal }
+        recalculateCounters()
+        persistQueue()
     }
 
     // MARK: - History & Presets
 
     public func removeHistoryEntry(id: UUID) {
         history.removeAll { $0.id == id }
-        store.saveHistory(history)
+        store.enqueueSaveHistory(history)
     }
 
     public func clearHistory() {
         history.removeAll()
-        store.saveHistory(history)
+        store.enqueueSaveHistory(history)
     }
 
     public func saveCustomPreset(name: String, subtitle: String, symbolName: String, configuration: DownloadConfiguration) {
@@ -330,208 +519,312 @@ public final class DownloadManager {
             isBuiltIn: false
         )
         customPresets.append(preset)
-        store.saveCustomPresets(customPresets)
+        store.enqueueSaveCustomPresets(customPresets)
     }
 
     public func deleteCustomPreset(id: UUID) {
         customPresets.removeAll { $0.id == id }
-        store.saveCustomPresets(customPresets)
+        store.enqueueSaveCustomPresets(customPresets)
+    }
+
+    // MARK: - Counters & Persistence
+
+    private func recalculateCounters() {
+        var active = 0
+        var queued = 0
+        var paused = 0
+        var completed = 0
+        var failed = 0
+
+        for task in queue {
+            switch task.status {
+            case .preparing, .downloading, .postProcessing:
+                active += 1
+            case .queued:
+                queued += 1
+            case .paused:
+                paused += 1
+            case .completed:
+                completed += 1
+            case .failed:
+                failed += 1
+            case .cancelled:
+                break
+            }
+        }
+
+        activeCount = active
+        queuedCount = queued
+        pausedCount = paused
+        completedCount = completed
+        failedCount = failed
+    }
+
+    private func persistQueue() {
+        let state = PersistedQueueState(
+            isQueuePaused: isQueuePaused,
+            items: queue.map { $0.makeSnapshot() }
+        )
+        store.enqueueSaveQueue(state)
+        onQueueChanged?()
     }
 
     // MARK: - Execution Pipeline
 
     private func pumpQueue() {
         guard !isQueuePaused else { return }
+        guard !engineManager.isWorking else { return }
         guard activeCount < maxConcurrentDownloads else { return }
 
-        // Start oldest queued item first (FIFO)
-        let queuedIndices = queue.indices.filter { queue[$0].status == .queued }.reversed()
-        for idx in queuedIndices {
+        // FIFO: earliest createdAt first, then playlistIndex ascending so #01 runs first while displaying at index 0.
+        let queuedTasks = queue
+            .filter { $0.status == .queued }
+            .sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt {
+                    return lhs.createdAt < rhs.createdAt
+                }
+                return (lhs.playlistIndex ?? 0) < (rhs.playlistIndex ?? 0)
+            }
+
+        for task in queuedTasks {
             guard activeCount < maxConcurrentDownloads else { break }
-            startItem(at: idx)
+            startItem(task)
         }
     }
 
-    private func startItem(at index: Int) {
-        let item = queue[index]
+    private func startItem(_ task: DownloadTask) {
+        guard !engineManager.isWorking else { return }
+
         guard let ytdlpPath = engineManager.ytdlpStatus.path else {
-            queue[index].status = .failed
-            queue[index].statusDetail = "yt-dlp not installed"
-            queue[index].errorMessage = "Install yt-dlp via Engine Setup before downloading."
+            task.status = .failed
+            task.statusDetail = "yt-dlp not installed"
+            task.errorMessage = "Install yt-dlp via Engine Setup before downloading."
+            recalculateCounters()
+            persistQueue()
             return
         }
 
         // Ensure destination folder exists
-        let expandedOutDir = (item.configuration.outputDirectoryPath as NSString).expandingTildeInPath
+        let expandedOutDir = (task.configuration.outputDirectoryPath as NSString).expandingTildeInPath
         do {
             try FileManager.default.createDirectory(
                 atPath: expandedOutDir,
                 withIntermediateDirectories: true
             )
         } catch {
-            queue[index].status = .failed
-            queue[index].statusDetail = "Output folder unavailable"
-            queue[index].errorMessage = error.localizedDescription
+            task.status = .failed
+            task.statusDetail = "Output folder unavailable"
+            task.errorMessage = error.localizedDescription
+            recalculateCounters()
+            persistQueue()
             return
         }
 
+        // Pre-flight disk space check (>= 256 MB)
+        let outURL = URL(fileURLWithPath: expandedOutDir, isDirectory: true)
+        if let values = try? outURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let availableBytes = values.volumeAvailableCapacityForImportantUsage,
+           availableBytes < 256 * 1024 * 1024 {
+            task.status = .failed
+            task.statusDetail = "Insufficient disk space"
+            task.errorMessage = "Insufficient disk space (< 256 MB available)."
+            recalculateCounters()
+            persistQueue()
+            return
+        }
+
+        let isVideoOnlyCustom = videoOnlyFormatTaskIDs.contains(task.id)
         let args = YTDLPCommandBuilder.buildArguments(
-            url: item.url,
-            configuration: item.configuration,
+            url: task.url,
+            configuration: task.configuration,
             ffmpegPath: engineManager.ffmpegStatus.path,
-            jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument
+            jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument,
+            customFormatIsVideoOnly: isVideoOnlyCustom
         )
 
-        queue[index].status = .preparing
-        queue[index].statusDetail = "Connecting & resolving streams…"
-        queue[index].logs.append("$ \(YTDLPCommandBuilder.shellPreview(ytdlpPath: ytdlpPath, url: item.url, configuration: item.configuration, ffmpegPath: engineManager.ffmpegStatus.path, jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument))")
+        task.status = .preparing
+        task.statusDetail = "Connecting & resolving streams…"
+        task.logBuffer.append(
+            "$ \(YTDLPCommandBuilder.shellPreview(ytdlpPath: ytdlpPath, url: task.url, configuration: task.configuration, ffmpegPath: engineManager.ffmpegStatus.path, jsRuntimeArg: engineManager.ytdlpJSRuntimeArgument, customFormatIsVideoOnly: isVideoOnlyCustom))"
+        )
+        recalculateCounters()
+        persistQueue()
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: ytdlpPath)
-        process.arguments = args
-        process.environment = EngineManager.enrichedEnvironment()
+        ProcessSupervisor.configure(
+            process,
+            executableURL: URL(fileURLWithPath: ytdlpPath),
+            arguments: args,
+            environment: EngineManager.enrichedEnvironment()
+        )
 
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
 
-        let taskID = item.id
+        let taskID = task.id
+        let ioQueue = DispatchQueue(label: "com.velora.download.\(taskID.uuidString)")
         let accumulator = ProcessLineAccumulator()
+        let coalescer = DownloadOutputCoalescer(ioQueue: ioQueue) { [weak self] batch in
+            Task { @MainActor [weak self] in
+                self?.handleOutputBatch(batch, for: taskID)
+            }
+        }
 
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            let lines = accumulator.append(data)
-            guard !lines.isEmpty else { return }
-            Task { @MainActor [weak self] in
-                for line in lines {
-                    self?.handleOutputLine(line, for: taskID)
-                }
+            ioQueue.sync {
+                let lines = accumulator.append(data)
+                guard !lines.isEmpty else { return }
+                coalescer.process(lines: lines)
             }
         }
 
         process.terminationHandler = { [weak self] proc in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            let trailing = accumulator.flush()
             let exitCode = proc.terminationStatus
             let reason = proc.terminationReason
-            Task { @MainActor [weak self] in
-                for line in trailing {
-                    self?.handleOutputLine(line, for: taskID)
+            let weakManager = self
+            ioQueue.async {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                let remaining = pipe.fileHandleForReading.readDataToEndOfFile()
+                var trailing: [String] = []
+                if !remaining.isEmpty {
+                    trailing.append(contentsOf: accumulator.append(remaining))
                 }
-                self?.handleProcessExit(taskID: taskID, status: exitCode, reason: reason)
+                trailing.append(contentsOf: accumulator.flush())
+                let finalBatch = coalescer.takeRemainingAndClose(trailingLines: trailing)
+
+                Task { @MainActor in
+                    if !finalBatch.isEmpty {
+                        weakManager?.handleOutputBatch(finalBatch, for: taskID)
+                    }
+                    weakManager?.handleProcessExit(taskID: taskID, status: exitCode, reason: reason)
+                }
             }
         }
 
         do {
-            try process.run()
-            runningProcesses[taskID] = process
+            let pid = try ProcessSupervisor.launchInNewProcessGroup(process)
+            runningProcesses[taskID] = RunningProcessEntry(process: process, pid: pid)
         } catch {
-            queue[index].status = .failed
-            queue[index].statusDetail = "Failed to launch yt-dlp"
-            queue[index].errorMessage = error.localizedDescription
+            pipe.fileHandleForReading.readabilityHandler = nil
+            task.status = .failed
+            task.statusDetail = "Failed to launch yt-dlp"
+            task.errorMessage = error.localizedDescription
+            recalculateCounters()
+            persistQueue()
             pumpQueue()
         }
     }
 
-    private func handleOutputLine(_ rawLine: String, for taskID: UUID) {
-        guard let idx = queue.firstIndex(where: { $0.id == taskID }) else { return }
+    private func handleOutputBatch(_ batch: [(YTDLPOutputEvent, String)], for taskID: UUID) {
+        guard let task = queue.first(where: { $0.id == taskID }) else { return }
+        guard !task.status.isTerminal && task.status != .paused else { return }
 
-        let event = YTDLPOutputParser.parse(line: rawLine)
-        switch event {
-        case let .metadata(title, uploader, extractor):
-            queue[idx].title = title
-            if let uploader { queue[idx].uploader = uploader }
-            if let extractor { queue[idx].extractor = extractor }
+        let previousStatus = task.status
+        var shouldPersistSnapshot = false
 
-        case let .playlistItemProgress(current, total):
-            queue[idx].playlistIndex = current
-            queue[idx].playlistTotal = total
-            queue[idx].status = .downloading
-            queue[idx].statusDetail = "Item \(current) of \(total) · Preparing…"
-            appendLog(rawLine, at: idx)
+        for (event, rawLine) in batch {
+            guard !task.status.isTerminal && task.status != .paused else { break }
 
-        case let .progress(fraction, speed, eta, totalSize):
-            queue[idx].status = .downloading
-            queue[idx].speedText = speed
-            queue[idx].etaText = eta
-            if let totalSize { queue[idx].fileSizeText = totalSize }
+            switch event {
+            case let .metadata(title, uploader, extractor):
+                task.title = title
+                if let uploader { task.uploader = uploader }
+                if let extractor { task.extractor = extractor }
+                shouldPersistSnapshot = true
 
-            let pctInt = Int((fraction * 100).rounded())
-            if queue[idx].configuration.playlistBehavior == .downloadEntirePlaylist,
-               let current = queue[idx].playlistIndex,
-               let total = queue[idx].playlistTotal,
-               total > 1 {
-                let overall = (Double(current - 1) + fraction) / Double(total)
-                queue[idx].progress = min(1.0, max(0.0, overall))
-                queue[idx].statusDetail = "Item \(current)/\(total) · \(pctInt)%"
-            } else {
-                queue[idx].progress = fraction
-                queue[idx].statusDetail = "Downloading \(pctInt)%"
+            case let .playlistItemProgress(current, total):
+                task.playlistIndex = current
+                task.playlistTotal = total
+                task.status = .downloading
+                task.statusDetail = "Item \(current) of \(total) · Preparing…"
+                task.logBuffer.append(rawLine)
+
+            case let .progress(fraction, speed, eta, totalSize):
+                task.status = .downloading
+                task.speedText = speed
+                task.etaText = eta
+                if let totalSize { task.fileSizeText = totalSize }
+
+                let pctInt = Int((fraction * 100).rounded())
+                if task.configuration.playlistBehavior == .downloadEntirePlaylist,
+                   let current = task.playlistIndex,
+                   let total = task.playlistTotal,
+                   total > 1 {
+                    let overall = (Double(current - 1) + fraction) / Double(total)
+                    task.progress = min(1.0, max(0.0, overall))
+                    task.statusDetail = "Item \(current)/\(total) · \(pctInt)%"
+                } else {
+                    task.progress = fraction
+                    task.statusDetail = "Downloading \(pctInt)%"
+                }
+
+            case let .postProcessing(stage):
+                task.status = .postProcessing
+                if task.configuration.playlistBehavior != .downloadEntirePlaylist {
+                    task.progress = max(task.progress, 0.99)
+                }
+                task.speedText = nil
+                task.etaText = nil
+                if task.configuration.playlistBehavior == .downloadEntirePlaylist,
+                   let current = task.playlistIndex,
+                   let total = task.playlistTotal,
+                   total > 1 {
+                    task.statusDetail = "Item \(current)/\(total) · \(stage)"
+                } else {
+                    task.statusDetail = stage
+                }
+                task.logBuffer.append(rawLine)
+
+            case let .destination(path):
+                task.outputFilePath = path
+                task.logBuffer.append(rawLine)
+
+            case let .finalFilePath(path):
+                task.outputFilePath = path
+                task.completedFileCount += 1
+                task.logBuffer.append("Saved: \(path)")
+                shouldPersistSnapshot = true
+
+                // For multi-item direct playlist downloads, record each finished video into history immediately.
+                if task.configuration.playlistBehavior == .downloadEntirePlaylist {
+                    recordHistory(for: task, filePath: path)
+                }
+
+            case let .error(message):
+                task.errorMessage = message
+                task.logBuffer.append(rawLine)
+
+            case let .log(line):
+                if !line.isEmpty {
+                    task.logBuffer.append(line)
+                }
             }
+        }
 
-        case let .postProcessing(stage):
-            queue[idx].status = .postProcessing
-            if queue[idx].configuration.playlistBehavior != .downloadEntirePlaylist {
-                queue[idx].progress = max(queue[idx].progress, 0.99)
-            }
-            queue[idx].speedText = nil
-            queue[idx].etaText = nil
-            if queue[idx].configuration.playlistBehavior == .downloadEntirePlaylist,
-               let current = queue[idx].playlistIndex,
-               let total = queue[idx].playlistTotal,
-               total > 1 {
-                queue[idx].statusDetail = "Item \(current)/\(total) · \(stage)"
-            } else {
-                queue[idx].statusDetail = stage
-            }
-            appendLog(rawLine, at: idx)
-
-        case let .destination(path):
-            queue[idx].outputFilePath = path
-            appendLog(rawLine, at: idx)
-
-        case let .finalFilePath(path):
-            queue[idx].outputFilePath = path
-            queue[idx].completedFileCount += 1
-            appendLog("Saved: \(path)", at: idx)
-
-            // For multi-item direct playlist downloads, record each finished video into history immediately.
-            if queue[idx].configuration.playlistBehavior == .downloadEntirePlaylist {
-                recordHistory(for: queue[idx], filePath: path)
-            }
-
-        case let .error(message):
-            queue[idx].errorMessage = message
-            appendLog(rawLine, at: idx)
-
-        case let .log(line):
-            if !line.isEmpty {
-                appendLog(line, at: idx)
-            }
+        if task.status != previousStatus {
+            recalculateCounters()
+            persistQueue()
+        } else if shouldPersistSnapshot {
+            persistQueue()
         }
     }
 
-    private func appendLog(_ line: String, at index: Int) {
-        queue[index].logs.append(line)
-        if queue[index].logs.count > 400 {
-            queue[index].logs.removeFirst(queue[index].logs.count - 400)
-        }
-    }
-
-    private func recordHistory(for item: DownloadTaskItem, filePath: String?) {
+    private func recordHistory(for task: DownloadTask, filePath: String?) {
         let fileSizeBytes: Int64? = filePath.flatMap { path in
             (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value
         }
         let entry = DownloadHistoryEntry(
-            url: item.url,
-            title: item.title,
-            uploader: item.uploader,
-            extractor: item.extractor,
-            thumbnailURL: item.thumbnailURL,
-            formatSummary: item.configuration.summaryBadge,
+            url: task.url,
+            title: task.title,
+            uploader: task.uploader,
+            extractor: task.extractor,
+            thumbnailURL: task.thumbnailURL,
+            formatSummary: task.configuration.summaryBadge,
             outputFilePath: filePath,
-            outputDirectoryPath: item.configuration.outputDirectoryPath,
+            outputDirectoryPath: task.configuration.outputDirectoryPath,
             fileSizeBytes: fileSizeBytes,
             completedAt: Date()
         )
@@ -539,56 +832,61 @@ public final class DownloadManager {
         if history.count > 500 {
             history.removeLast(history.count - 500)
         }
-        store.saveHistory(history)
+        store.enqueueSaveHistory(history)
     }
 
     private func handleProcessExit(taskID: UUID, status: Int32, reason: Process.TerminationReason) {
         runningProcesses.removeValue(forKey: taskID)
-        guard let idx = queue.firstIndex(where: { $0.id == taskID }) else {
+        guard let task = queue.first(where: { $0.id == taskID }) else {
             pumpQueue()
             return
         }
 
-        if queue[idx].status == .cancelled {
+        if task.status == .cancelled || task.status == .paused {
+            recalculateCounters()
             pumpQueue()
             return
         }
 
-        let isDirectPlaylist = queue[idx].configuration.playlistBehavior == .downloadEntirePlaylist
+        let isDirectPlaylist = task.configuration.playlistBehavior == .downloadEntirePlaylist
         // With --ignore-errors on playlists, yt-dlp exits 1 if 1 private video failed while 19 succeeded.
-        let succeeded = (status == 0 && reason == .exit) || (isDirectPlaylist && queue[idx].completedFileCount > 0 && reason == .exit)
+        let succeeded = (status == 0 && reason == .exit) || (isDirectPlaylist && task.completedFileCount > 0 && reason == .exit)
 
         if succeeded {
-            queue[idx].status = .completed
-            queue[idx].progress = 1.0
-            queue[idx].speedText = nil
-            queue[idx].etaText = nil
-            if isDirectPlaylist && queue[idx].completedFileCount > 1 {
-                queue[idx].statusDetail = status == 0
-                    ? "Completed (\(queue[idx].completedFileCount) files)"
-                    : "Completed \(queue[idx].completedFileCount) files (some skipped)"
+            task.status = .completed
+            task.progress = 1.0
+            task.speedText = nil
+            task.etaText = nil
+            if isDirectPlaylist && task.completedFileCount > 1 {
+                task.statusDetail = status == 0
+                    ? "Completed (\(task.completedFileCount) files)"
+                    : "Completed \(task.completedFileCount) files (some skipped)"
             } else {
-                queue[idx].statusDetail = "Completed"
+                task.statusDetail = "Completed"
             }
-            queue[idx].completedAt = Date()
+            task.completedAt = Date()
 
             if !isDirectPlaylist {
-                recordHistory(for: queue[idx], filePath: queue[idx].outputFilePath)
-            }
-
-            // Play completion chime only when this finishes the active burst or single job (avoid spamming 50 chimes).
-            if playSoundOnComplete && activeCount == 0 && queuedCount == 0 {
-                NSSound(named: NSSound.Name("Glass"))?.play()
+                recordHistory(for: task, filePath: task.outputFilePath)
             }
         } else {
-            queue[idx].status = .failed
-            queue[idx].speedText = nil
-            queue[idx].etaText = nil
-            queue[idx].statusDetail = "Download failed (code \(status))"
-            if queue[idx].errorMessage == nil {
-                queue[idx].errorMessage = queue[idx].logs.last(where: { !$0.isEmpty })
+            task.status = .failed
+            task.speedText = nil
+            task.etaText = nil
+            task.statusDetail = "Download failed (code \(status))"
+            if task.errorMessage == nil {
+                task.errorMessage = task.logBuffer.lines.last(where: { !$0.isEmpty })
                     ?? "yt-dlp exited with code \(status)."
             }
+        }
+
+        recalculateCounters()
+        persistQueue()
+        onTaskFinished?(task, succeeded)
+
+        // Play completion chime only when this finishes the active burst or single job (avoid spamming 50 chimes).
+        if succeeded && playSoundOnComplete && activeCount == 0 && queuedCount == 0 {
+            NSSound(named: NSSound.Name("Glass"))?.play()
         }
 
         pumpQueue()

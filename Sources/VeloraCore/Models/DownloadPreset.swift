@@ -97,7 +97,7 @@ public struct DownloadPreset: Identifiable, Codable, Sendable, Equatable {
             DownloadPreset(
                 id: UUID(uuidString: "10000000-0000-0000-0000-000000000003")!,
                 name: "Best MP4",
-                subtitle: "Max resolution · H.264 MP4",
+                subtitle: "Max resolution · MP4 (H.264 preferred)",
                 symbolName: "crown",
                 configuration: bestMP4,
                 isBuiltIn: true
@@ -105,7 +105,7 @@ public struct DownloadPreset: Identifiable, Codable, Sendable, Equatable {
             DownloadPreset(
                 id: UUID(uuidString: "10000000-0000-0000-0000-000000000004")!,
                 name: "Apple Pro",
-                subtitle: "HEVC MOV · AirDrop & Final Cut friendly",
+                subtitle: "HEVC/H.264 MOV · AirDrop & Final Cut friendly",
                 symbolName: "applelogo",
                 configuration: appleNative,
                 isBuiltIn: true

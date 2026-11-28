@@ -3,6 +3,15 @@ import Foundation
 /// Pure command-line builder that translates `DownloadConfiguration` into exact `yt-dlp` arguments.
 public enum YTDLPCommandBuilder {
 
+    private static let dangerousExtraFlags: [String] = [
+        "--exec",
+        "--exec-before-download",
+        "--config-location",
+        "--config-locations",
+        "--plugin-dirs",
+        "--load-info-json"
+    ]
+
     public static func sanitizeURL(_ rawURL: String) -> String {
         var cleaned = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if (cleaned.hasPrefix("<") && cleaned.hasSuffix(">")) ||
@@ -11,6 +20,75 @@ public enum YTDLPCommandBuilder {
             cleaned = String(cleaned.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return cleaned
+    }
+
+    /// Validates that `rawURL` is a well-formed `http://` or `https://` media URL with a non-empty host and no whitespace/control characters.
+    public static func isValidMediaURL(_ rawURL: String) -> Bool {
+        let cleaned = sanitizeURL(rawURL)
+        guard !cleaned.isEmpty else { return false }
+        let forbiddenScalars = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        guard !cleaned.unicodeScalars.contains(where: { forbiddenScalars.contains($0) }) else {
+            return false
+        }
+        guard let components = URLComponents(string: cleaned),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    /// Detects dangerous `yt-dlp` flags in a user-provided extra arguments string (including `--flag=value` forms).
+    public static func dangerousExtraArgumentFlags(in rawExtra: String) -> [String] {
+        var seen: Set<String> = []
+        var detected: [String] = []
+        for token in tokenizeShellArguments(rawExtra) {
+            let lower = token.lowercased()
+            if let match = dangerousExtraFlags.first(where: { lower == $0 || lower.hasPrefix("\($0)=") }),
+               seen.insert(match).inserted {
+                detected.append(match)
+            }
+        }
+        return detected
+    }
+
+    private static func sanitizeExtraArgumentTokens(_ tokens: [String]) -> [String] {
+        var sanitized: [String] = []
+        var index = 0
+        while index < tokens.count {
+            let token = tokens[index]
+            let lower = token.lowercased()
+            if token == "--" {
+                index += 1
+                continue
+            }
+            if let _ = dangerousExtraFlags.first(where: { lower == $0 || lower.hasPrefix("\($0)=") }) {
+                // Skip standalone value token so payloads like `--exec "cmd"` cannot leak as positional URLs.
+                if !lower.contains("=") && index + 1 < tokens.count {
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            sanitized.append(token)
+            index += 1
+        }
+        return sanitized
+    }
+
+    private static func sanitizeFilenameTemplate(_ rawTemplate: String) -> String {
+        let normalized = rawTemplate.replacingOccurrences(of: "\\", with: "/")
+        let safeParts = normalized
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+            .filter { $0 != "." && $0 != ".." }
+        if safeParts.isEmpty {
+            return FilenameTemplatePreset.cleanTitle.templateString
+        }
+        return safeParts.joined(separator: "/")
     }
 
     /// Extracts, sanitizes, and deduplicates `http://` and `https://` URLs from pasted text, newline lists, or CSVs.
@@ -42,9 +120,10 @@ public enum YTDLPCommandBuilder {
         url: String,
         configuration: DownloadConfiguration,
         ffmpegPath: String? = nil,
-        jsRuntimeArg: String? = nil
+        jsRuntimeArg: String? = nil,
+        customFormatIsVideoOnly: Bool = false
     ) -> [String] {
-        var args: [String] = []
+        var args: [String] = ["--ignore-config", "--no-exec"]
 
         // Network reliability: avoid IPv6 blackholes on macOS networks & set bounded socket timeout.
         if let ipFlag = configuration.networkIPVersion.ytdlpFlag {
@@ -53,21 +132,28 @@ public enum YTDLPCommandBuilder {
         let timeout = max(5, min(120, configuration.socketTimeoutSeconds))
         args.append(contentsOf: ["--socket-timeout", "\(timeout)"])
 
+        // Resume & bounded retry behavior
+        args.append(configuration.resumePartialDownloads ? "--continue" : "--no-continue")
+        if configuration.autoRetryCount > 0 {
+            let retries = max(1, min(10, configuration.autoRetryCount))
+            args.append(contentsOf: ["--retries", "\(retries)", "--fragment-retries", "\(retries)", "--retry-sleep", "exp=1:16"])
+        }
+
         // Enable detected JS runtime (deno/bun/node/quickjs) for yt-dlp 2026+ YouTube EJS format resolution.
         if let jsRuntimeArg, !jsRuntimeArg.isEmpty {
             args.append(contentsOf: ["--js-runtimes", jsRuntimeArg])
         }
 
-        // Always emit structured progress & final path while actually downloading.
+        // Always emit structured JSON progress, metadata & final path while actually downloading.
         args.append(contentsOf: [
             "--newline",
             "--no-colors",
             "--no-simulate",
             "--progress",
             "--progress-template",
-            "download:VELORA_PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_estimate_str)s|%(progress._downloaded_bytes_str)s",
-            "--print", "before_dl:VELORA_META|%(title)s|%(uploader)s|%(extractor)s",
-            "--print", "after_move:VELORA_FILEPATH|%(filepath)s"
+            "download:VELORA_PROGRESS_JSON:%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,speed,eta,_percent_str,_speed_str,_eta_str})j",
+            "--print", "before_dl:VELORA_META_JSON:%(.{title,uploader,channel,extractor_key,extractor,is_live})j",
+            "--print", "after_move:VELORA_FILEPATH_JSON:%(.{filepath})j"
         ])
 
         // Point yt-dlp directly to ffmpeg/ffprobe so Finder-launched GUI apps always find them.
@@ -77,7 +163,11 @@ public enum YTDLPCommandBuilder {
         }
 
         // Format selection
-        appendFormatArguments(to: &args, configuration: configuration)
+        appendFormatArguments(
+            to: &args,
+            configuration: configuration,
+            customFormatIsVideoOnly: customFormatIsVideoOnly
+        )
 
         // Subtitles
         switch configuration.subtitleMode {
@@ -98,17 +188,22 @@ public enum YTDLPCommandBuilder {
                 args.append(contentsOf: ["--convert-subs", "srt"])
             }
         case .allAvailable:
-            args.append("--all-subs")
-            if configuration.includeAutoSubtitles {
-                args.append("--write-auto-subs")
-            }
+            args.append(contentsOf: ["--write-subs", "--sub-langs", "all,-live_chat"])
             if configuration.embedSubtitles && configuration.mode != .audioOnly {
                 args.append("--embed-subs")
+            } else {
+                args.append(contentsOf: ["--convert-subs", "srt"])
             }
         }
 
         // Post-processing & metadata
-        if configuration.embedThumbnail {
+        let supportsEmbeddedThumbnail: Bool = switch configuration.mode {
+        case .audioOnly:
+            configuration.audioFormat != .wav && configuration.audioFormat != .aac
+        case .videoOnly, .videoAndAudio:
+            configuration.videoContainer != .webm
+        }
+        if configuration.embedThumbnail && supportsEmbeddedThumbnail {
             args.append("--embed-thumbnail")
         }
         if configuration.embedMetadata {
@@ -164,11 +259,13 @@ public enum YTDLPCommandBuilder {
         let outputDir = (configuration.outputDirectoryPath as NSString).expandingTildeInPath
         args.append(contentsOf: ["-P", outputDir])
 
+        let safeBaseTemplate = sanitizeFilenameTemplate(configuration.effectiveFilenameTemplate)
         let template: String
         if configuration.playlistBehavior == .downloadEntirePlaylist && configuration.createPlaylistSubfolder {
-            template = "%(playlist_title,playlist)s/%(playlist_index)02d - \(configuration.effectiveFilenameTemplate)"
+            args.append("--windows-filenames")
+            template = "%(playlist_title,playlist)s/%(playlist_index)02d - \(safeBaseTemplate)"
         } else {
-            template = configuration.effectiveFilenameTemplate
+            template = safeBaseTemplate
         }
         args.append(contentsOf: ["-o", template])
 
@@ -201,12 +298,19 @@ public enum YTDLPCommandBuilder {
             args.append(contentsOf: ["--cookies-from-browser", cookieBrowser])
         }
 
-        // Power-user extra arguments
-        let extraTokens = tokenizeShellArguments(configuration.extraArguments)
+        let rawCookieFile = configuration.cookieFilePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rawCookieFile.isEmpty {
+            let expandedCookieFile = (rawCookieFile as NSString).expandingTildeInPath
+            args.append(contentsOf: ["--cookies", expandedCookieFile])
+        }
+
+        // Power-user extra arguments (filtered against dangerous RCE/config flags)
+        let extraTokens = sanitizeExtraArgumentTokens(tokenizeShellArguments(configuration.extraArguments))
         if !extraTokens.isEmpty {
             args.append(contentsOf: extraTokens)
         }
 
+        args.append("--no-exec")
         args.append("--")
         args.append(sanitizeURL(url))
         return args
@@ -214,11 +318,18 @@ public enum YTDLPCommandBuilder {
 
     private static func appendFormatArguments(
         to args: inout [String],
-        configuration: DownloadConfiguration
+        configuration: DownloadConfiguration,
+        customFormatIsVideoOnly: Bool
     ) {
         if let customID = configuration.customFormatID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !customID.isEmpty {
-            args.append(contentsOf: ["-f", customID])
+            let selector: String
+            if configuration.mode == .videoAndAudio && customFormatIsVideoOnly && !customID.contains("+") {
+                selector = "\(customID)+bestaudio/best"
+            } else {
+                selector = customID
+            }
+            args.append(contentsOf: ["-f", selector])
             if configuration.mode == .videoAndAudio {
                 args.append(contentsOf: ["--merge-output-format", configuration.videoContainer.rawValue])
             }
@@ -284,17 +395,40 @@ public enum YTDLPCommandBuilder {
         if let maxHeight = configuration.videoQuality.maxHeight {
             sortTokens.append("res:\(maxHeight)")
         }
-        if let codecToken = configuration.preferredCodec.ytdlpSortToken {
-            sortTokens.append(codecToken)
-        }
+
         switch configuration.videoContainer {
-        case .mp4, .mov:
+        case .mov:
+            switch configuration.preferredCodec {
+            case .auto, .hevc:
+                sortTokens.append(contentsOf: ["vcodec:h265", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"])
+            case .h264:
+                sortTokens.append(contentsOf: ["vcodec:h264", "vcodec:h265", "acodec:aac", "ext:mp4:m4a"])
+            case .vp9, .av1:
+                if let codecToken = configuration.preferredCodec.ytdlpSortToken {
+                    sortTokens.append(codecToken)
+                }
+                sortTokens.append("ext:mp4:m4a")
+            }
+        case .mp4:
+            if let codecToken = configuration.preferredCodec.ytdlpSortToken {
+                sortTokens.append(codecToken)
+            }
             sortTokens.append("ext:mp4:m4a")
         case .webm:
+            if let codecToken = configuration.preferredCodec.ytdlpSortToken {
+                sortTokens.append(codecToken)
+            }
             sortTokens.append("ext:webm:opus")
         case .mkv:
-            break
+            if let codecToken = configuration.preferredCodec.ytdlpSortToken {
+                sortTokens.append(codecToken)
+            }
         }
+
+        if configuration.videoQuality == .best && !sortTokens.isEmpty {
+            sortTokens.insert("res", at: 0)
+        }
+
         if !sortTokens.isEmpty {
             args.append(contentsOf: ["-S", sortTokens.joined(separator: ",")])
         }
@@ -306,7 +440,8 @@ public enum YTDLPCommandBuilder {
         url: String,
         configuration: DownloadConfiguration,
         ffmpegPath: String? = nil,
-        jsRuntimeArg: String? = nil
+        jsRuntimeArg: String? = nil,
+        customFormatIsVideoOnly: Bool = false
     ) -> String {
         let executable = ytdlpPath.isEmpty ? "yt-dlp" : ytdlpPath
         let sanitized = sanitizeURL(url)
@@ -317,10 +452,14 @@ public enum YTDLPCommandBuilder {
             url: displayURL,
             configuration: configuration,
             ffmpegPath: ffmpegPath,
-            jsRuntimeArg: jsRuntimeArg
+            jsRuntimeArg: jsRuntimeArg,
+            customFormatIsVideoOnly: customFormatIsVideoOnly
         )
             .filter { token in
                 // Keep preview readable while preserving every meaningful option.
+                !token.hasPrefix("download:VELORA_PROGRESS_JSON:") &&
+                !token.hasPrefix("before_dl:VELORA_META_JSON:") &&
+                !token.hasPrefix("after_move:VELORA_FILEPATH_JSON:") &&
                 !token.hasPrefix("download:VELORA_PROGRESS|") &&
                 !token.hasPrefix("before_dl:VELORA_META|") &&
                 !token.hasPrefix("after_move:VELORA_FILEPATH|")

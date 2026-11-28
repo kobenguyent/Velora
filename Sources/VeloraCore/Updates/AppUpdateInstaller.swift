@@ -1,13 +1,18 @@
 import AppKit
 import CryptoKit
 import Foundation
+import Security
 
-public enum AppUpdateInstallError: LocalizedError, Sendable {
+public enum AppUpdateInstallError: LocalizedError, Sendable, Equatable {
     case checksumMismatch(expected: String, actual: String)
+    case missingChecksumManifest
+    case invalidRepository(String)
     case extractionFailed(String)
     case appBundleNotFound
     case bundleIdentifierMismatch(expected: String, actual: String)
     case invalidAppBundle(String)
+    case symlinkNotAllowed(String)
+    case codeSignatureInvalid(String)
     case notRunningFromAppBundle(stagedAppPath: String)
     case failedToLaunchUpdater(String)
 
@@ -15,6 +20,10 @@ public enum AppUpdateInstallError: LocalizedError, Sendable {
         switch self {
         case let .checksumMismatch(expected, actual):
             "Downloaded update failed SHA-256 verification (expected \(expected.prefix(12))…, got \(actual.prefix(12))…)."
+        case .missingChecksumManifest:
+            "Update verification failed: release is missing a valid SHA-256 checksum manifest."
+        case .invalidRepository(let repo):
+            "Invalid GitHub repository '\(repo)'. Use owner/repo (e.g. kobenguyent/Velora)."
         case .extractionFailed(let details):
             "Could not extract update archive: \(details)"
         case .appBundleNotFound:
@@ -23,6 +32,10 @@ public enum AppUpdateInstallError: LocalizedError, Sendable {
             "Update bundle identifier mismatch (expected \(expected), found \(actual))."
         case .invalidAppBundle(let details):
             "Downloaded app bundle is invalid: \(details)"
+        case .symlinkNotAllowed(let path):
+            "Update bundle contains a disallowed symbolic link at \(path)."
+        case .codeSignatureInvalid(let details):
+            "Update bundle failed code signature verification: \(details)"
         case .notRunningFromAppBundle(let stagedPath):
             "Velora is running as a development binary rather than an installed .app bundle. The downloaded update has been extracted to: \(stagedPath)"
         case .failedToLaunchUpdater(let details):
@@ -55,7 +68,11 @@ public enum AppUpdateInstaller {
         expectedBundleIdentifier: String?
     ) throws -> URL {
         let extractedDir = stagingDirectory.appendingPathComponent("extracted", isDirectory: true)
-        try FileManager.default.createDirectory(at: extractedDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: extractedDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
 
         let ditto = Process()
         ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -121,8 +138,62 @@ public enum AppUpdateInstaller {
         return nil
     }
 
+    public static var isRunningFromAppBundle: Bool {
+        Bundle.main.bundleURL.pathExtension.lowercased() == "app"
+    }
+
+    public static func currentAppTeamIdentifier() -> String? {
+        guard isRunningFromAppBundle else { return nil }
+        var selfCode: SecCode?
+        guard SecCodeCopySelf([], &selfCode) == errSecSuccess, let selfCode else {
+            return nil
+        }
+        var selfStatic: SecStaticCode?
+        guard SecCodeCopyStaticCode(selfCode, [], &selfStatic) == errSecSuccess, let selfStatic else {
+            return nil
+        }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            selfStatic,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &info
+        ) == errSecSuccess,
+        let dict = info as? [String: Any],
+        let teamID = dict[kSecCodeInfoTeamIdentifier as String] as? String,
+        !teamID.isEmpty else {
+            return nil
+        }
+        return teamID
+    }
+
+    private static func rejectSymlink(at url: URL) throws {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        if (attrs?[.type] as? FileAttributeType) == .typeSymbolicLink {
+            throw AppUpdateInstallError.symlinkNotAllowed(url.path)
+        }
+    }
+
     public static func validateAppBundle(at appURL: URL, expectedBundleIdentifier: String?) throws {
-        let infoPlistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        try rejectSymlink(at: appURL)
+        let contentsURL = appURL.appendingPathComponent("Contents", isDirectory: true)
+        try rejectSymlink(at: contentsURL)
+        let infoPlistURL = contentsURL.appendingPathComponent("Info.plist", isDirectory: false)
+        try rejectSymlink(at: infoPlistURL)
+        let macOSDirURL = contentsURL.appendingPathComponent("MacOS", isDirectory: true)
+        try rejectSymlink(at: macOSDirURL)
+
+        if let enumerator = FileManager.default.enumerator(
+            at: macOSDirURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey]
+        ) {
+            for case let itemURL as URL in enumerator {
+                try rejectSymlink(at: itemURL)
+                if (try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                    throw AppUpdateInstallError.symlinkNotAllowed(itemURL.path)
+                }
+            }
+        }
+
         guard let plistData = try? Data(contentsOf: infoPlistURL),
               let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any] else {
             throw AppUpdateInstallError.invalidAppBundle("Missing or unreadable Contents/Info.plist.")
@@ -142,9 +213,62 @@ public enum AppUpdateInstaller {
             throw AppUpdateInstallError.invalidAppBundle("Missing CFBundleExecutable in Info.plist.")
         }
 
-        let executableURL = appURL.appendingPathComponent("Contents/MacOS/\(executableName)")
+        guard !executableName.contains("/"),
+              !executableName.contains("\\"),
+              !executableName.contains(".."),
+              executableName != "." else {
+            throw AppUpdateInstallError.invalidAppBundle("Unsafe CFBundleExecutable '\(executableName)' in Info.plist.")
+        }
+
+        let executableURL = macOSDirURL.appendingPathComponent(executableName, isDirectory: false)
+        try rejectSymlink(at: executableURL)
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw AppUpdateInstallError.invalidAppBundle("Executable \(executableName) is missing or not executable.")
+        }
+
+        try validateCodeSignature(at: appURL)
+    }
+
+    public static func validateCodeSignature(
+        at appURL: URL,
+        requireSigned: Bool = isRunningFromAppBundle,
+        expectedTeamIdentifier: String? = currentAppTeamIdentifier()
+    ) throws {
+        var staticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(appURL as CFURL, [], &staticCode)
+        guard createStatus == errSecSuccess, let staticCode else {
+            throw AppUpdateInstallError.codeSignatureInvalid("Unable to inspect code signature (status \(createStatus)).")
+        }
+
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate)
+        let validityStatus = SecStaticCodeCheckValidity(staticCode, flags, nil)
+
+        if validityStatus == errSecCSUnsigned && !requireSigned {
+            if let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty {
+                throw AppUpdateInstallError.codeSignatureInvalid(
+                    "Update bundle is unsigned (expected team \(expectedTeamIdentifier))."
+                )
+            }
+            return
+        }
+
+        guard validityStatus == errSecSuccess else {
+            throw AppUpdateInstallError.codeSignatureInvalid("Code signature validation failed (status \(validityStatus)).")
+        }
+
+        if let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty {
+            var stagedInfo: CFDictionary?
+            let infoStatus = SecCodeCopySigningInformation(
+                staticCode,
+                SecCSFlags(rawValue: kSecCSSigningInformation),
+                &stagedInfo
+            )
+            let stagedTeam = (stagedInfo as? [String: Any])?[kSecCodeInfoTeamIdentifier as String] as? String
+            guard infoStatus == errSecSuccess, stagedTeam == expectedTeamIdentifier else {
+                throw AppUpdateInstallError.codeSignatureInvalid(
+                    "Signing team identifier mismatch (expected \(expectedTeamIdentifier), found \(stagedTeam ?? "none"))."
+                )
+            }
         }
     }
 
@@ -176,6 +300,8 @@ public enum AppUpdateInstaller {
         BACKUP_APP="${TARGET_APP}.velora-backup"
         LOG_FILE=\(qLog)
 
+        trap 'rm -rf "$STAGING_DIR" 2>/dev/null || true; rm -f "$0" 2>/dev/null || true' EXIT
+
         mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
         exec >>"$LOG_FILE" 2>&1
 
@@ -199,29 +325,24 @@ public enum AppUpdateInstaller {
         echo "[Velora Updater] Current app closed. Swapping bundle at $TARGET_APP"
 
         swap_direct() {
-            rm -rf "$BACKUP_APP"
             if [ -e "$TARGET_APP" ]; then
-                mv "$TARGET_APP" "$BACKUP_APP" || return 1
+                /bin/rm -rf "$BACKUP_APP"
+                /bin/mv "$TARGET_APP" "$BACKUP_APP" || return 1
             fi
             if /usr/bin/ditto "$STAGED_APP" "$TARGET_APP" && [ -d "$TARGET_APP/Contents/MacOS" ]; then
                 /usr/bin/xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
                 touch "$TARGET_APP" 2>/dev/null || true
-                rm -rf "$BACKUP_APP"
+                /bin/rm -rf "$BACKUP_APP"
                 return 0
             else
                 echo "[Velora Updater] Copy failed; rolling back previous app bundle."
-                rm -rf "$TARGET_APP"
+                /bin/rm -rf "$TARGET_APP"
                 if [ -e "$BACKUP_APP" ]; then
-                    mv "$BACKUP_APP" "$TARGET_APP" || true
+                    /bin/mv "$BACKUP_APP" "$TARGET_APP" || true
                 fi
                 return 1
             fi
         }
-
-        if [ "${1:-}" = "--swap-only" ]; then
-            swap_direct
-            exit $?
-        fi
 
         if [ -w "$TARGET_DIR" ] && { [ ! -e "$TARGET_APP" ] || [ -w "$TARGET_APP" ]; }; then
             if ! swap_direct; then
@@ -230,8 +351,14 @@ public enum AppUpdateInstaller {
             fi
         else
             echo "[Velora Updater] Elevated permissions required for $TARGET_DIR; prompting via macOS authorization."
-            export VELORA_UPDATER_SCRIPT="$0"
-            /usr/bin/osascript -e 'do shell script "/bin/sh " & quoted form of (system attribute "VELORA_UPDATER_SCRIPT") & " --swap-only" with administrator privileges'
+            export VELORA_TARGET_APP="$TARGET_APP"
+            export VELORA_STAGED_APP="$STAGED_APP"
+            export VELORA_BACKUP_APP="$BACKUP_APP"
+            /usr/bin/osascript \\
+                -e 'set t to quoted form of (system attribute "VELORA_TARGET_APP")' \\
+                -e 'set s to quoted form of (system attribute "VELORA_STAGED_APP")' \\
+                -e 'set b to quoted form of (system attribute "VELORA_BACKUP_APP")' \\
+                -e 'do shell script "T=" & t & "; S=" & s & "; B=" & b & "; if [ -e \\"$T\\" ]; then /bin/rm -rf \\"$B\\" && /bin/mv \\"$T\\" \\"$B\\" || exit 1; fi; if /usr/bin/ditto \\"$S\\" \\"$T\\" && [ -d \\"$T/Contents/MacOS\\" ]; then /usr/bin/xattr -dr com.apple.quarantine \\"$T\\" 2>/dev/null || true; /usr/bin/touch \\"$T\\" 2>/dev/null || true; /bin/rm -rf \\"$B\\"; else /bin/rm -rf \\"$T\\"; [ -e \\"$B\\" ] && /bin/mv \\"$B\\" \\"$T\\" || true; exit 1; fi" with administrator privileges'
             if [ $? -ne 0 ] || [ ! -d "$TARGET_APP/Contents/MacOS" ]; then
                 echo "[Velora Updater] Elevated update cancelled or failed."
                 exit 1
@@ -240,10 +367,6 @@ public enum AppUpdateInstaller {
 
         echo "[Velora Updater] Update installed successfully. Relaunching Velora..."
         /usr/bin/open -n "$TARGET_APP"
-
-        # Clean up staging workspace and self-delete
-        rm -rf "$STAGING_DIR" 2>/dev/null || true
-        rm -f "$0" 2>/dev/null || true
         echo "[Velora Updater] Finished cleanly at $(date)"
         """
     }

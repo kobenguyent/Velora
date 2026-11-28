@@ -18,7 +18,16 @@ public enum YTDLPOutputParser {
         let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !line.isEmpty else { return .log(line: "") }
 
-        // 1. Structured progress template:
+        // 1. JSON structured progress template:
+        // VELORA_PROGRESS_JSON:{"status":"downloading","downloaded_bytes":...}
+        if line.hasPrefix("VELORA_PROGRESS_JSON:") {
+            let jsonPart = String(line.dropFirst("VELORA_PROGRESS_JSON:".count)).trimmingCharacters(in: .whitespaces)
+            if let event = parseProgressJSON(jsonPart) {
+                return event
+            }
+        }
+
+        // 1b. Legacy pipe-delimited progress template:
         // VELORA_PROGRESS| 42.3%|  8.42MiB/s|00:08| 120.50MiB| 50.97MiB
         if line.hasPrefix("VELORA_PROGRESS|") {
             let parts = line.split(separator: "|", omittingEmptySubsequences: false).map {
@@ -36,7 +45,17 @@ public enum YTDLPOutputParser {
             }
         }
 
-        // 2. Structured final filepath:
+        // 2. JSON structured final filepath:
+        if line.hasPrefix("VELORA_FILEPATH_JSON:") {
+            let jsonPart = String(line.dropFirst("VELORA_FILEPATH_JSON:".count)).trimmingCharacters(in: .whitespaces)
+            if let data = jsonPart.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(FilepathJSONPayload.self, from: data),
+               let path = payload.filepath.flatMap(cleanMetric) {
+                return .finalFilePath(path: path)
+            }
+        }
+
+        // 2b. Legacy structured final filepath:
         if line.hasPrefix("VELORA_FILEPATH|") {
             let path = String(line.dropFirst("VELORA_FILEPATH|".count)).trimmingCharacters(in: .whitespaces)
             if !path.isEmpty && path != "NA" {
@@ -44,7 +63,20 @@ public enum YTDLPOutputParser {
             }
         }
 
-        // 3. Structured metadata line:
+        // 3. JSON structured metadata line:
+        if line.hasPrefix("VELORA_META_JSON:") {
+            let jsonPart = String(line.dropFirst("VELORA_META_JSON:".count)).trimmingCharacters(in: .whitespaces)
+            if let data = jsonPart.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(MetaJSONPayload.self, from: data),
+               let rawTitle = payload.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawTitle.isEmpty && rawTitle != "NA" {
+                let uploader = payload.uploader.flatMap(cleanMetric) ?? payload.channel.flatMap(cleanMetric)
+                let extractor = payload.extractor_key.flatMap(cleanMetric) ?? payload.extractor.flatMap(cleanMetric)
+                return .metadata(title: rawTitle, uploader: uploader, extractor: extractor)
+            }
+        }
+
+        // 3b. Legacy structured metadata line:
         if line.hasPrefix("VELORA_META|") {
             let parts = line.split(separator: "|", omittingEmptySubsequences: false).map {
                 String($0).trimmingCharacters(in: .whitespaces)
@@ -123,9 +155,115 @@ public enum YTDLPOutputParser {
         return .log(line: line)
     }
 
+    private struct MetaJSONPayload: Decodable {
+        let title: String?
+        let uploader: String?
+        let channel: String?
+        let extractor_key: String?
+        let extractor: String?
+        let is_live: Bool?
+    }
+
+    private struct FilepathJSONPayload: Decodable {
+        let filepath: String?
+    }
+
+    private struct ProgressJSONPayload: Decodable {
+        let status: String?
+        let downloaded_bytes: Double?
+        let total_bytes: Double?
+        let total_bytes_estimate: Double?
+        let speed: Double?
+        let eta: Double?
+        let _percent_str: String?
+        let _speed_str: String?
+        let _eta_str: String?
+    }
+
+    private static func parseProgressJSON(_ jsonString: String) -> YTDLPOutputEvent? {
+        guard let data = jsonString.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(ProgressJSONPayload.self, from: data) else {
+            return nil
+        }
+
+        let speedText = formatSpeed(payload.speed) ?? payload._speed_str.flatMap(cleanMetric)
+        let totalBytes = payload.total_bytes ?? payload.total_bytes_estimate
+
+        if payload.status == "finished" {
+            let finalSize = formatBytes(totalBytes ?? payload.downloaded_bytes)
+            return .progress(fraction: 1.0, speed: speedText, eta: "00:00", totalSize: finalSize)
+        }
+
+        if let total = totalBytes, total > 0 {
+            let fraction: Double
+            if let downloaded = payload.downloaded_bytes {
+                fraction = max(0.0, min(1.0, downloaded / total))
+            } else if let pct = parsePercent(payload._percent_str) {
+                fraction = max(0.0, min(1.0, pct / 100.0))
+            } else {
+                fraction = 0.0
+            }
+            let etaText = formatETA(payload.eta) ?? payload._eta_str.flatMap(cleanMetric)
+            return .progress(fraction: fraction, speed: speedText, eta: etaText, totalSize: formatBytes(total))
+        }
+
+        if let pct = parsePercent(payload._percent_str) {
+            let etaText = formatETA(payload.eta) ?? payload._eta_str.flatMap(cleanMetric)
+            return .progress(
+                fraction: max(0.0, min(1.0, pct / 100.0)),
+                speed: speedText,
+                eta: etaText,
+                totalSize: formatBytes(payload.downloaded_bytes)
+            )
+        }
+
+        // Indeterminate / live stream progress when neither total_bytes nor total_bytes_estimate is known
+        let etaText = formatETA(payload.eta) ?? payload._eta_str.flatMap(cleanMetric) ?? "Live"
+        return .progress(
+            fraction: 0.0,
+            speed: speedText,
+            eta: etaText,
+            totalSize: formatBytes(payload.downloaded_bytes)
+        )
+    }
+
+    private static func parsePercent(_ raw: String?) -> Double? {
+        guard let raw else { return nil }
+        let cleaned = raw.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
+        return Double(cleaned)
+    }
+
+    private static func formatBytes(_ bytes: Double?) -> String? {
+        guard let bytes, bytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes.rounded()), countStyle: .file)
+    }
+
+    private static func formatSpeed(_ bytesPerSecond: Double?) -> String? {
+        guard let bytesPerSecond, bytesPerSecond > 0 else { return nil }
+        let formatted = ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond.rounded()), countStyle: .file)
+        return "\(formatted)/s"
+    }
+
+    private static func formatETA(_ seconds: Double?) -> String? {
+        guard let seconds, seconds >= 0 else { return nil }
+        let total = Int(seconds.rounded())
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%02d:%02d", m, s)
+    }
+
     private static func cleanMetric(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty || trimmed == "NA" || trimmed == "N/A" || trimmed == "Unknown" || trimmed == "~" {
+        if trimmed.isEmpty ||
+           trimmed == "NA" ||
+           trimmed == "N/A" ||
+           trimmed == "Unknown" ||
+           trimmed == "Unknown B/s" ||
+           trimmed == "~" {
             return nil
         }
         return trimmed

@@ -66,6 +66,7 @@ public final class UpdateChecker {
         }
     }
 
+    private let urlSession: URLSession
     private var activeDownloadDelegate: ReleaseDownloadDelegate?
     private var activeDownloadSession: URLSession?
     private var activeDownloadTask: URLSessionDownloadTask?
@@ -76,6 +77,32 @@ public final class UpdateChecker {
         static let includePrereleases = "velora.updates.includePrereleases"
         static let skippedVersion = "velora.updates.skippedVersion"
         static let lastCheckedAt = "velora.updates.lastCheckedAt"
+    }
+
+    nonisolated public static func isValidGitHubRepository(_ repo: String) -> Bool {
+        let trimmed = repo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pattern = #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"#
+        guard trimmed.range(of: pattern, options: .regularExpression) != nil else {
+            return false
+        }
+        let parts = trimmed.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2 else { return false }
+        let owner = parts[0]
+        let name = parts[1]
+        return owner != "." && owner != ".." && name != "." && name != ".."
+    }
+
+    nonisolated public static func isAllowedGitHubDownloadURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              !host.isEmpty else {
+            return false
+        }
+        return host == "github.com"
+            || host == "api.github.com"
+            || host == "objects.githubusercontent.com"
+            || host == "release-assets.githubusercontent.com"
+            || host.hasSuffix(".githubusercontent.com")
     }
 
     public static var currentVersionString: String {
@@ -99,7 +126,8 @@ public final class UpdateChecker {
         return "kobenguyent/Velora"
     }
 
-    public init() {
+    public init(urlSession: URLSession = .shared) {
+        self.urlSession = urlSession
         let savedRepo = UserDefaults.standard.string(forKey: Keys.githubRepository)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.githubRepository = (savedRepo?.isEmpty == false) ? savedRepo! : Self.defaultRepository
@@ -125,9 +153,9 @@ public final class UpdateChecker {
         if case .installing = state { return }
 
         let repo = githubRepository.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard repo.contains("/") else {
+        guard Self.isValidGitHubRepository(repo) else {
             if userInitiated {
-                state = .failed("Invalid GitHub repository format. Use owner/repo (e.g. kobenguyent/Velora).")
+                state = .failed(AppUpdateInstallError.invalidRepository(repo).localizedDescription)
                 isPresentingUpdateSheet = true
             }
             return
@@ -188,15 +216,48 @@ public final class UpdateChecker {
         }
     }
 
-    /// Downloads the release `.zip`, verifies SHA-256 checksum (if present), extracts & validates `.app`.
+    /// Downloads the release `.zip`, verifies its mandatory SHA-256 checksum, extracts & validates `.app`.
     /// When `autoInstallAfterDownload` is true, immediately closes the running app to apply the update.
     public func downloadUpdate(_ update: AvailableUpdate, autoInstallAfterDownload: Bool = false) async {
         let stagingDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("VeloraUpdate-\(UUID().uuidString)", isDirectory: true)
-        let zipDestination = stagingDir.appendingPathComponent(update.downloadAsset.name)
 
         do {
-            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+            guard let checksumAsset = update.checksumAsset else {
+                throw AppUpdateInstallError.missingChecksumManifest
+            }
+
+            guard Self.isAllowedGitHubDownloadURL(update.downloadAsset.browserDownloadURL) else {
+                throw NSError(
+                    domain: "Velora.UpdateChecker",
+                    code: NSURLErrorUnsupportedURL,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Refusing update download from untrusted URL: \(update.downloadAsset.browserDownloadURL.absoluteString)"
+                    ]
+                )
+            }
+
+            guard Self.isAllowedGitHubDownloadURL(checksumAsset.browserDownloadURL) else {
+                throw NSError(
+                    domain: "Velora.UpdateChecker",
+                    code: NSURLErrorUnsupportedURL,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Refusing checksum manifest download from untrusted URL: \(checksumAsset.browserDownloadURL.absoluteString)"
+                    ]
+                )
+            }
+
+            let assetFileName = (update.downloadAsset.name as NSString).lastPathComponent
+            guard !assetFileName.isEmpty, assetFileName != ".", assetFileName != ".." else {
+                throw AppUpdateInstallError.invalidAppBundle("Invalid release asset filename.")
+            }
+            let zipDestination = stagingDir.appendingPathComponent(assetFileName, isDirectory: false)
+
+            try FileManager.default.createDirectory(
+                at: stagingDir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
             state = .downloading(update, progress: 0, receivedBytes: 0, totalBytes: update.downloadAsset.size)
 
             try await downloadFile(
@@ -217,26 +278,26 @@ public final class UpdateChecker {
 
             state = .verifying(update)
 
-            // Verify SHA-256 digest when SHA256SUMS.txt is attached to the release
-            var verifiedDigest: String?
-            if let checksumAsset = update.checksumAsset {
-                var request = URLRequest(url: checksumAsset.browserDownloadURL)
-                request.setValue("Velora/\(Self.currentVersionString)", forHTTPHeaderField: "User-Agent")
-                let (manifestData, _) = try await URLSession.shared.data(for: request)
-                if let manifestText = String(data: manifestData, encoding: .utf8),
-                   let expectedHash = ReleaseAssetMatcher.extractExpectedSHA256(
-                    forFileName: update.downloadAsset.name,
+            // Fail-closed SHA-256 verification against the release checksum manifest
+            var request = URLRequest(url: checksumAsset.browserDownloadURL)
+            request.setValue("Velora/\(Self.currentVersionString)", forHTTPHeaderField: "User-Agent")
+            let (manifestData, manifestResponse) = try await urlSession.data(for: request)
+            guard let httpResponse = manifestResponse as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode),
+                  let manifestText = String(data: manifestData, encoding: .utf8),
+                  let expectedHash = ReleaseAssetMatcher.extractExpectedSHA256(
+                    forFileName: assetFileName,
                     from: manifestText
-                   ) {
-                    let actualHash = try await Task.detached(priority: .userInitiated) {
-                        try AppUpdateInstaller.sha256Hex(of: zipDestination)
-                    }.value
+                  ) else {
+                throw AppUpdateInstallError.missingChecksumManifest
+            }
 
-                    guard actualHash.lowercased() == expectedHash.lowercased() else {
-                        throw AppUpdateInstallError.checksumMismatch(expected: expectedHash, actual: actualHash)
-                    }
-                    verifiedDigest = actualHash
-                }
+            let actualHash = try await Task.detached(priority: .userInitiated) {
+                try AppUpdateInstaller.sha256Hex(of: zipDestination)
+            }.value
+
+            guard actualHash.lowercased() == expectedHash.lowercased() else {
+                throw AppUpdateInstallError.checksumMismatch(expected: expectedHash, actual: actualHash)
             }
 
             let expectedBundleID = Bundle.main.bundleIdentifier
@@ -252,7 +313,7 @@ public final class UpdateChecker {
                 update: update,
                 stagedAppURL: stagedAppURL,
                 stagingDirectoryURL: stagingDir,
-                verifiedSHA256: verifiedDigest
+                verifiedSHA256: actualHash
             )
             state = .readyToInstall(staged)
 
@@ -283,6 +344,10 @@ public final class UpdateChecker {
     // MARK: - GitHub API & Download Helpers
 
     private func fetchLatestRelease(repository: String, includePrereleases: Bool) async throws -> GitHubRelease? {
+        guard Self.isValidGitHubRepository(repository) else {
+            throw AppUpdateInstallError.invalidRepository(repository)
+        }
+
         let endpoint: String
         if includePrereleases {
             endpoint = "https://api.github.com/repos/\(repository)/releases?per_page=10"
@@ -300,7 +365,7 @@ public final class UpdateChecker {
         request.setValue("Velora/\(Self.currentVersionString)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 20
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
@@ -351,7 +416,7 @@ public final class UpdateChecker {
                     continuation.resume(with: result)
                 }
             )
-            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            let session = URLSession(configuration: urlSession.configuration, delegate: delegate, delegateQueue: nil)
             var request = URLRequest(url: remoteURL)
             request.setValue("Velora/\(Self.currentVersionString)", forHTTPHeaderField: "User-Agent")
             let task = session.downloadTask(with: request)
@@ -369,6 +434,7 @@ private final class ReleaseDownloadDelegate: NSObject, URLSessionDownloadDelegat
     private let onProgress: @Sendable (Int64, Int64) -> Void
     private let lock = NSLock()
     private var completion: (@Sendable (Result<Void, Error>) -> Void)?
+    private var lastProgressReportTime: ContinuousClock.Instant?
 
     init(
         destinationURL: URL,
@@ -390,12 +456,42 @@ private final class ReleaseDownloadDelegate: NSObject, URLSessionDownloadDelegat
 
     func urlSession(
         _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        if let redirectURL = request.url, UpdateChecker.isAllowedGitHubDownloadURL(redirectURL) {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
         didWriteData bytesWritten: Int64,
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+        let now = ContinuousClock.now
+        lock.lock()
+        let shouldReport: Bool
+        if let last = lastProgressReportTime {
+            shouldReport = (now - last) >= .milliseconds(100)
+                || (totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite)
+        } else {
+            shouldReport = true
+        }
+        if shouldReport {
+            lastProgressReportTime = now
+        }
+        lock.unlock()
+
+        if shouldReport {
+            onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+        }
     }
 
     func urlSession(

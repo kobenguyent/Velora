@@ -142,4 +142,227 @@ struct YTDLPCommandBuilderTests {
         #expect(decoded.networkIPVersion == .ipv4)
         #expect(decoded.socketTimeoutSeconds == 20)
     }
+
+    @Test("Validates http/https media URLs and rejects unsafe schemes or whitespace")
+    func validatesMediaURLs() {
+        #expect(YTDLPCommandBuilder.isValidMediaURL("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        #expect(YTDLPCommandBuilder.isValidMediaURL("http://example.com/video.mp4"))
+        #expect(YTDLPCommandBuilder.isValidMediaURL("  <https://youtu.be/abc?si=1>  "))
+
+        #expect(!YTDLPCommandBuilder.isValidMediaURL(""))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("file:///etc/passwd"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("ftp://example.com/video.mp4"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("javascript:alert(1)"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("https://"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("http:///missing-host"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("https://example.com/has space"))
+        #expect(!YTDLPCommandBuilder.isValidMediaURL("https://example.com/\u{0000}ctrl"))
+    }
+
+    @Test("Detects and strips dangerous extraArguments while enforcing --ignore-config and --no-exec")
+    func detectsAndStripsDangerousExtraArguments() {
+        let detected = YTDLPCommandBuilder.dangerousExtraArgumentFlags(
+            in: #"--geo-bypass --exec "rm -rf /" --exec-before-download=id --config-location /tmp/a --config-locations=/tmp/b --plugin-dirs /tmp/p --load-info-json=/tmp/info.json -x --extract-audio"#
+        )
+        #expect(detected == [
+            "--exec",
+            "--exec-before-download",
+            "--config-location",
+            "--config-locations",
+            "--plugin-dirs",
+            "--load-info-json"
+        ])
+        #expect(YTDLPCommandBuilder.dangerousExtraArgumentFlags(in: "-x --no-exec --geo-bypass").isEmpty)
+
+        var config = DownloadConfiguration()
+        config.extraArguments = #"--geo-bypass --exec "touch /tmp/pwned" --plugin-dirs=/tmp/plugins --sleep-interval 2"#
+        let args = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/video",
+            configuration: config
+        )
+
+        #expect(args.prefix(2) == ["--ignore-config", "--no-exec"])
+        #expect(args.contains("--geo-bypass"))
+        #expect(args.contains("--sleep-interval"))
+        #expect(args.contains("2"))
+        #expect(!args.contains("--exec"))
+        #expect(!args.contains("touch /tmp/pwned"))
+        #expect(!args.contains("--plugin-dirs=/tmp/plugins"))
+        #expect(args.suffix(3) == ["--no-exec", "--", "https://example.com/video"])
+    }
+
+    @Test("Emits JSON wire templates and keeps security flags in shellPreview")
+    func jsonWireTemplatesAndShellPreview() {
+        let config = DownloadConfiguration()
+        let args = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/watch?v=1",
+            configuration: config
+        )
+
+        #expect(args.contains("download:VELORA_PROGRESS_JSON:%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,speed,eta,_percent_str,_speed_str,_eta_str})j"))
+        #expect(args.contains("before_dl:VELORA_META_JSON:%(.{title,uploader,channel,extractor_key,extractor,is_live})j"))
+        #expect(args.contains("after_move:VELORA_FILEPATH_JSON:%(.{filepath})j"))
+
+        let preview = YTDLPCommandBuilder.shellPreview(
+            ytdlpPath: "/usr/local/bin/yt-dlp",
+            url: "https://example.com/watch?v=1",
+            configuration: config
+        )
+        #expect(preview.contains("--ignore-config"))
+        #expect(preview.contains("--no-exec"))
+        #expect(!preview.contains("VELORA_PROGRESS_JSON"))
+        #expect(!preview.contains("VELORA_META_JSON"))
+        #expect(!preview.contains("VELORA_FILEPATH_JSON"))
+        #expect(!preview.contains("--progress-template"))
+        #expect(!preview.contains("--print"))
+    }
+
+    @Test("Emits resume and bounded auto-retry flags")
+    func resumeAndRetryFlags() {
+        var config = DownloadConfiguration()
+        config.resumePartialDownloads = true
+        config.autoRetryCount = 5
+        let retryArgs = YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config)
+        #expect(retryArgs.contains("--continue"))
+        #expect(!retryArgs.contains("--no-continue"))
+        #expect(retryArgs.contains("--retries"))
+        #expect(retryArgs.contains("5"))
+        #expect(retryArgs.contains("--fragment-retries"))
+        #expect(retryArgs.contains("--retry-sleep"))
+        #expect(retryArgs.contains("exp=1:16"))
+
+        config.resumePartialDownloads = false
+        config.autoRetryCount = 0
+        let noRetryArgs = YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config)
+        #expect(noRetryArgs.contains("--no-continue"))
+        #expect(!noRetryArgs.contains("--continue"))
+        #expect(!noRetryArgs.contains("--retries"))
+        #expect(!noRetryArgs.contains("--fragment-retries"))
+        #expect(!noRetryArgs.contains("--retry-sleep"))
+
+        config.autoRetryCount = 99
+        let clampedArgs = YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config)
+        #expect(clampedArgs.contains("10"))
+        #expect(!clampedArgs.contains("99"))
+    }
+
+    @Test("Omits --embed-thumbnail for unsupported webm, wav, and aac formats")
+    func embedThumbnailContainerGuards() {
+        var config = DownloadConfiguration()
+        config.embedThumbnail = true
+
+        config.mode = .videoAndAudio
+        config.videoContainer = .webm
+        #expect(!YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config).contains("--embed-thumbnail"))
+
+        config.mode = .videoOnly
+        config.videoContainer = .webm
+        #expect(!YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config).contains("--embed-thumbnail"))
+
+        config.mode = .audioOnly
+        config.audioFormat = .wav
+        #expect(!YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config).contains("--embed-thumbnail"))
+
+        config.audioFormat = .aac
+        #expect(!YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config).contains("--embed-thumbnail"))
+
+        config.audioFormat = .m4a
+        #expect(YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config).contains("--embed-thumbnail"))
+    }
+
+    @Test("Appends +bestaudio/best when custom format ID is video-only in videoAndAudio mode")
+    func customFormatVideoOnlyAudioMerge() {
+        var config = DownloadConfiguration()
+        config.mode = .videoAndAudio
+        config.customFormatID = "313"
+
+        let videoOnlyCustomArgs = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/v",
+            configuration: config,
+            customFormatIsVideoOnly: true
+        )
+        #expect(videoOnlyCustomArgs.contains("313+bestaudio/best"))
+
+        let muxedCustomArgs = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/v",
+            configuration: config,
+            customFormatIsVideoOnly: false
+        )
+        #expect(muxedCustomArgs.contains("313"))
+        #expect(!muxedCustomArgs.contains("313+bestaudio/best"))
+
+        let preview = YTDLPCommandBuilder.shellPreview(
+            ytdlpPath: "yt-dlp",
+            url: "https://example.com/v",
+            configuration: config,
+            customFormatIsVideoOnly: true
+        )
+        #expect(preview.contains("313+bestaudio/best"))
+    }
+
+    @Test("Builds resolution-first sort flags for Best MP4 and Apple-compatible sort flags for MOV")
+    func sortFlagsForBestMP4AndAppleProMOV() throws {
+        let presets = DownloadPreset.builtInPresets
+        #expect(presets.count == 6)
+        #expect(presets.allSatisfy { !$0.subtitle.isEmpty })
+
+        let bestMP4 = try #require(presets.first { $0.name == "Best MP4" })
+        let bestMP4Args = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/v",
+            configuration: bestMP4.configuration
+        )
+        #expect(bestMP4Args.contains("res,vcodec:h264,ext:mp4:m4a"))
+
+        let applePro = try #require(presets.first { $0.name == "Apple Pro" })
+        let appleProArgs = YTDLPCommandBuilder.buildArguments(
+            url: "https://example.com/v",
+            configuration: applePro.configuration
+        )
+        #expect(appleProArgs.contains("res:2160,vcodec:h265,vcodec:h264,acodec:aac,ext:mp4:m4a"))
+        #expect(appleProArgs.contains("--remux-video"))
+        #expect(appleProArgs.contains("mov"))
+    }
+
+    @Test("Uses --write-subs --sub-langs all,-live_chat for allAvailable subtitles and supports cookieFilePath")
+    func allAvailableSubtitlesAndCookieFile() {
+        var config = DownloadConfiguration()
+        config.subtitleMode = .allAvailable
+        config.includeAutoSubtitles = true
+        config.embedSubtitles = false
+        config.cookieFilePath = "  ~/Downloads/cookies.txt  "
+
+        let args = YTDLPCommandBuilder.buildArguments(url: "https://example.com/v", configuration: config)
+        #expect(args.contains("--write-subs"))
+        #expect(args.contains("--sub-langs"))
+        #expect(args.contains("all,-live_chat"))
+        #expect(!args.contains("--all-subs"))
+        #expect(!args.contains("--write-auto-subs"))
+        #expect(args.contains("--convert-subs"))
+        #expect(args.contains("srt"))
+        #expect(args.contains("--cookies"))
+        let expectedCookiesPath = ("~/Downloads/cookies.txt" as NSString).expandingTildeInPath
+        #expect(args.contains(expectedCookiesPath))
+    }
+
+    @Test("Sanitizes playlist subfolder path traversal and custom filename template .. segments")
+    func playlistSubfolderAndTemplateTraversalGuard() {
+        var config = DownloadConfiguration()
+        config.playlistBehavior = .downloadEntirePlaylist
+        config.createPlaylistSubfolder = true
+        config.filenamePreset = .custom
+        config.customFilenameTemplate = "../../escape/../%(title)s.%(ext)s"
+
+        let args = YTDLPCommandBuilder.buildArguments(
+            url: "https://www.youtube.com/playlist?list=PL123",
+            configuration: config
+        )
+        #expect(args.contains("--windows-filenames"))
+        if let oIdx = args.firstIndex(of: "-o"), oIdx + 1 < args.count {
+            let template = args[oIdx + 1]
+            #expect(!template.contains(".."))
+            #expect(template == "%(playlist_title,playlist)s/%(playlist_index)02d - escape/%(title)s.%(ext)s")
+        } else {
+            Issue.record("Expected -o template argument")
+        }
+    }
 }

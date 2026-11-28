@@ -64,6 +64,7 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
     public let playlistEntries: [PlaylistEntry]
     public let linkedPlaylistURL: String?
     public let formats: [MediaFormat]
+    public let isLive: Bool
 
     public init(
         id: String,
@@ -79,7 +80,8 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
         playlistCount: Int? = nil,
         playlistEntries: [PlaylistEntry] = [],
         linkedPlaylistURL: String? = nil,
-        formats: [MediaFormat] = []
+        formats: [MediaFormat] = [],
+        isLive: Bool = false
     ) {
         self.id = id
         self.webpageURL = webpageURL
@@ -95,6 +97,7 @@ public struct MediaInfo: Sendable, Codable, Equatable, Identifiable {
         self.playlistEntries = playlistEntries
         self.linkedPlaylistURL = linkedPlaylistURL
         self.formats = formats
+        self.isLive = isLive
     }
 
     public static func formatDuration(_ seconds: Double?) -> String? {

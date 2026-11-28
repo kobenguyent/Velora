@@ -139,25 +139,39 @@ public enum PlaylistURLDetector {
 private final class InspectorProcessBox: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
+    private var pid: pid_t = 0
     private var cancelled = false
 
-    func store(_ proc: Process) -> Bool {
+    func store(_ proc: Process, pid: pid_t = 0) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if cancelled {
             return false
         }
         process = proc
+        self.pid = pid
         return true
+    }
+
+    func updatePID(_ pid: pid_t) {
+        lock.lock()
+        self.pid = pid
+        let shouldKill = cancelled
+        let proc = process
+        lock.unlock()
+        if shouldKill, let proc {
+            ProcessSupervisor.terminateProcessGroup(pid: pid, process: proc, graceSeconds: 0.5)
+        }
     }
 
     func terminate() {
         lock.lock()
         cancelled = true
         let proc = process
+        let activePID = pid
         lock.unlock()
-        if let proc, proc.isRunning {
-            proc.terminate()
+        if let proc {
+            ProcessSupervisor.terminateProcessGroup(pid: activePID, process: proc, graceSeconds: 0.5)
         }
     }
 
@@ -204,7 +218,7 @@ public enum MediaInspector {
         }
 
         let trimmedURL = YTDLPCommandBuilder.sanitizeURL(rawURL)
-        guard !trimmedURL.isEmpty, URL(string: trimmedURL) != nil else {
+        guard YTDLPCommandBuilder.isValidMediaURL(trimmedURL) else {
             throw MediaInspectorError.invalidURL
         }
 
@@ -223,7 +237,7 @@ public enum MediaInspector {
             targetURL = trimmedURL
         }
 
-        var args: [String] = []
+        var args: [String] = ["--ignore-config", "--no-exec"]
         if let ipFlag = networkIPVersion.ytdlpFlag {
             args.append(ipFlag)
         }
@@ -264,9 +278,12 @@ public enum MediaInspector {
             try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async {
                     let process = Process()
-                    process.executableURL = URL(fileURLWithPath: ytdlpPath)
-                    process.arguments = immutableArgs
-                    process.environment = EngineManager.enrichedEnvironment()
+                    ProcessSupervisor.configure(
+                        process,
+                        executableURL: URL(fileURLWithPath: ytdlpPath),
+                        arguments: immutableArgs,
+                        environment: EngineManager.enrichedEnvironment()
+                    )
 
                     let stdout = Pipe()
                     let stderr = Pipe()
@@ -282,7 +299,7 @@ public enum MediaInspector {
                     let timeoutWork = DispatchWorkItem {
                         if process.isRunning {
                             timedOutFlag.terminate()
-                            process.terminate()
+                            processBox.terminate()
                         }
                     }
                     DispatchQueue.global(qos: .utility).asyncAfter(
@@ -291,7 +308,8 @@ public enum MediaInspector {
                     )
 
                     do {
-                        try process.run()
+                        let pid = try ProcessSupervisor.launchInNewProcessGroup(process)
+                        processBox.updatePID(pid)
 
                         // Drain stdout & stderr concurrently to eliminate any 64KB pipe buffer deadlock.
                         let outBox = DataBox()
@@ -347,7 +365,14 @@ public enum MediaInspector {
     }
 
     public static func decodeMetadata(from data: Data, fallbackURL: String) throws -> MediaInfo {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let jsonData: Data
+        if let firstBrace = data.firstIndex(of: UInt8(ascii: "{")) {
+            jsonData = data.subdata(in: firstBrace..<data.endIndex)
+        } else {
+            jsonData = data
+        }
+
+        guard let root = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
             throw MediaInspectorError.decodingFailed("Expected a JSON object.")
         }
 
@@ -359,6 +384,7 @@ public enum MediaInspector {
         let duration = (root["duration"] as? Double) ?? (root["duration"] as? Int).map(Double.init)
         let viewCount = root["view_count"] as? Int
         let uploadDate = root["upload_date"] as? String
+        let isLive = (root["is_live"] as? Bool) ?? ((root["live_status"] as? String) == "is_live")
 
         let rawEntries = root["entries"] as? [[String: Any]]
         let isPlaylist = (root["_type"] as? String) == "playlist" || rawEntries != nil
@@ -466,7 +492,8 @@ public enum MediaInspector {
             playlistCount: playlistCount,
             playlistEntries: parsedEntries,
             linkedPlaylistURL: linkedPlaylistURL,
-            formats: parsedFormats
+            formats: parsedFormats,
+            isLive: isLive
         )
     }
 
