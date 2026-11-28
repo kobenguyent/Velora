@@ -253,6 +253,109 @@ struct EngineManagerTests {
         #expect(timedOut.timedOut)
     }
 
+    @Test("Normalizes CLI version output and compares numeric versions accurately")
+    func versionNormalizationAndComparison() {
+        #expect(EngineManager.normalizeVersion("2026.11.23", for: "yt-dlp") == "2026.11.23")
+        #expect(EngineManager.normalizeVersion("ffmpeg version 9.1-https://www.martin-riedl.de Copyright (c)", for: "ffmpeg") == "9.1")
+        #expect(EngineManager.normalizeVersion("deno 2.9.8 (stable, release, aarch64-apple-darwin)", for: "deno") == "2.9.8")
+        #expect(EngineManager.normalizeVersion("v22.12.0", for: "node") == "22.12.0")
+
+        #expect(EngineManager.compareVersions("9.1", "9.1.0") == .orderedSame)
+        #expect(EngineManager.compareVersions("2026.11.09", "2026.11.23") == .orderedAscending)
+        #expect(EngineManager.compareVersions("2.9.7", "2.9.8") == .orderedAscending)
+        #expect(EngineManager.compareVersions("9.2", "9.1") == .orderedDescending)
+
+        #expect(EngineManager.parseLatestVersion(fromRedirectLocation: "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.11.23", for: "yt-dlp") == "2026.11.23")
+        #expect(EngineManager.parseLatestVersion(fromRedirectLocation: "/download/macos/arm64/1795207104_9.1/ffmpeg.zip", for: "ffmpeg") == "9.1")
+        #expect(EngineManager.parseLatestVersion(fromRedirectLocation: "https://github.com/denoland/deno/releases/tag/v2.9.8", for: "deno") == "2.9.8")
+    }
+
+    @Test("checkForEngineUpdates detects outdated vs up-to-date engines and installMissingOrOutdatedManagedEngines skips current ones")
+    @MainActor
+    func updateCheckAndSelectiveInstaller() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("velora-update-check-\(UUID().uuidString)", isDirectory: true)
+        let binDir = workspace.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        func writeScript(_ name: String, output: String) throws {
+            let url = binDir.appendingPathComponent(name)
+            try Data("#!/bin/sh\necho '\(output)'\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
+        // yt-dlp outdated (2026.11.09 vs 2026.11.23), ffmpeg current (9.1 vs 9.1), deno missing
+        try writeScript("yt-dlp", output: "2026.11.09")
+        try writeScript("ffmpeg", output: "ffmpeg version 9.1-https://www.martin-riedl.de")
+
+        let newYTDLPPayload = Data("#!/bin/sh\necho '2026.11.23'\n".utf8)
+        let ytdlpDigest = sha256Hex(newYTDLPPayload)
+        let ytdlpManifest = Data("\(ytdlpDigest)  yt-dlp_macos\n".utf8)
+
+        let denoPayload = Data("#!/bin/sh\necho 'deno 2.9.8 (stable, release, aarch64-apple-darwin)'\n".utf8)
+        let denoZip = try createExecutableZip(name: "deno", contents: denoPayload, in: workspace)
+        let denoDigest = sha256Hex(denoZip)
+
+        let session = makeMockSession { request in
+            let urlStr = request.url!.absoluteString
+            if urlStr == "https://github.com/yt-dlp/yt-dlp/releases/latest" {
+                return (
+                    302,
+                    Data(),
+                    request.url!,
+                    ["Location": "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.11.23"]
+                )
+            } else if urlStr.hasSuffix("/release/ffmpeg.zip") {
+                return (
+                    307,
+                    Data(),
+                    request.url!,
+                    ["Location": "/download/macos/arm64/1795207104_9.1/ffmpeg.zip"]
+                )
+            } else if urlStr == "https://github.com/denoland/deno/releases/latest" {
+                return (
+                    302,
+                    Data(),
+                    request.url!,
+                    ["Location": "https://github.com/denoland/deno/releases/tag/v2.9.8"]
+                )
+            } else if request.url?.lastPathComponent == "yt-dlp_macos" {
+                return (200, newYTDLPPayload, request.url!, [:])
+            } else if request.url?.lastPathComponent == "SHA2-256SUMS" {
+                return (200, ytdlpManifest, request.url!, [:])
+            } else if urlStr.contains("/deno-") && urlStr.hasSuffix(".zip") {
+                return (200, denoZip, request.url!, [:])
+            } else if urlStr.contains("/deno-") && urlStr.hasSuffix(".sha256sum") {
+                let archiveName = request.url!.lastPathComponent.replacingOccurrences(of: ".sha256sum", with: "")
+                return (200, Data("\(denoDigest)  \(archiveName)\n".utf8), request.url!, [:])
+            }
+            // ffmpeg archive should NEVER be fetched by selective update because ffmpeg is already 9.1
+            if urlStr.contains("/download/macos/") {
+                Issue.record("Unexpected download for up-to-date ffmpeg")
+            }
+            return (404, Data(), request.url!, [:])
+        }
+
+        let manager = EngineManager(urlSession: session, binDirectory: binDir)
+        await manager.refresh()
+        await manager.checkForEngineUpdates()
+
+        #expect(manager.ytdlpUpdateState == .updateAvailable(installed: "2026.11.09", latest: "2026.11.23"))
+        #expect(manager.ffmpegUpdateState == .upToDate(latest: "9.1"))
+        #expect(manager.outdatedEngineCount == 1)
+        #expect(manager.missingEngineCount >= 0)
+
+        // Make sure JS runtime state reflects notInstalled when deno isn't in PATH or if external node exists
+        let beforeFFmpegBytes = try Data(contentsOf: binDir.appendingPathComponent("ffmpeg"))
+        await manager.installMissingOrOutdatedManagedEngines()
+        #expect(manager.lastError == nil)
+        #expect(manager.ytdlpUpdateState == .upToDate(latest: "2026.11.23"))
+        #expect(manager.ffmpegUpdateState == .upToDate(latest: "9.1"))
+        #expect(try Data(contentsOf: binDir.appendingPathComponent("ffmpeg")) == beforeFFmpegBytes)
+        #expect(manager.installLogs.contains(where: { $0.contains("ffmpeg is already up to date (9.1), skipping.") }))
+    }
+
     // MARK: - Helpers
 
     private func sha256Hex(_ data: Data) -> String {
@@ -295,6 +398,15 @@ struct EngineManagerTests {
     private func makeMockSession(
         handler: @escaping @Sendable (URLRequest) throws -> (statusCode: Int, data: Data, responseURL: URL)
     ) -> URLSession {
+        makeMockSession { request in
+            let (statusCode, data, responseURL) = try handler(request)
+            return (statusCode, data, responseURL, [:])
+        }
+    }
+
+    private func makeMockSession(
+        handler: @escaping @Sendable (URLRequest) throws -> (statusCode: Int, data: Data, responseURL: URL, headers: [String: String])
+    ) -> URLSession {
         let token = EngineMockURLProtocol.register(handler: handler)
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [EngineMockURLProtocol.self]
@@ -304,7 +416,7 @@ struct EngineManagerTests {
 }
 
 private final class EngineMockURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest) throws -> (statusCode: Int, data: Data, responseURL: URL)
+    typealias Handler = @Sendable (URLRequest) throws -> (statusCode: Int, data: Data, responseURL: URL, headers: [String: String])
 
     private final class HandlerStore: @unchecked Sendable {
         private let lock = NSLock()
@@ -346,12 +458,14 @@ private final class EngineMockURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         do {
-            let (statusCode, data, responseURL) = try handler(request)
+            let (statusCode, data, responseURL, customHeaders) = try handler(request)
+            var headerFields = customHeaders
+            headerFields["Content-Length"] = "\(data.count)"
             let response = HTTPURLResponse(
                 url: responseURL,
                 statusCode: statusCode,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Length": "\(data.count)"]
+                headerFields: headerFields
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)

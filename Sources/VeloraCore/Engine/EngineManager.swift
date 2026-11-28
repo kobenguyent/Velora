@@ -96,6 +96,37 @@ public struct BinaryStatus: Sendable, Equatable {
     }
 }
 
+public enum EngineUpdateState: Sendable, Equatable {
+    case unknown
+    case checking
+    case notInstalled(latest: String?)
+    case upToDate(latest: String)
+    case updateAvailable(installed: String, latest: String)
+
+    public var needsUpdate: Bool {
+        if case .updateAvailable = self { return true }
+        return false
+    }
+
+    public var isUpToDate: Bool {
+        if case .upToDate = self { return true }
+        return false
+    }
+
+    public var latestVersion: String? {
+        switch self {
+        case .unknown, .checking:
+            return nil
+        case .notInstalled(let latest):
+            return latest
+        case .upToDate(let latest):
+            return latest
+        case .updateAvailable(_, let latest):
+            return latest
+        }
+    }
+}
+
 /// Discovers, validates, installs, and updates `yt-dlp` and `ffmpeg` binaries on macOS.
 @MainActor
 @Observable
@@ -103,6 +134,11 @@ public final class EngineManager {
     public private(set) var ytdlpStatus = BinaryStatus(name: "yt-dlp", path: nil, version: nil, source: .missing)
     public private(set) var ffmpegStatus = BinaryStatus(name: "ffmpeg", path: nil, version: nil, source: .missing)
     public private(set) var jsRuntimeStatus = BinaryStatus(name: "JS Runtime", path: nil, version: nil, source: .missing)
+    public private(set) var ytdlpUpdateState: EngineUpdateState = .unknown
+    public private(set) var ffmpegUpdateState: EngineUpdateState = .unknown
+    public private(set) var jsRuntimeUpdateState: EngineUpdateState = .unknown
+    public private(set) var isCheckingUpdates: Bool = false
+    public private(set) var lastUpdateCheckAt: Date?
     public private(set) var ytdlpJSRuntimeArgument: String?
     public private(set) var homebrewPath: String?
     public private(set) var isWorking: Bool = false
@@ -149,6 +185,23 @@ public final class EngineManager {
         ytdlpStatus.isInstalled && ffmpegStatus.isInstalled
     }
 
+    public var outdatedEngineCount: Int {
+        [ytdlpUpdateState, ffmpegUpdateState, jsRuntimeUpdateState].filter(\.needsUpdate).count
+    }
+
+    public var missingEngineCount: Int {
+        [ytdlpStatus, ffmpegStatus, jsRuntimeStatus].filter { !$0.isInstalled }.count
+    }
+
+    public var allEnginesUpToDate: Bool {
+        ytdlpStatus.isInstalled &&
+        ffmpegStatus.isInstalled &&
+        jsRuntimeStatus.isInstalled &&
+        ytdlpUpdateState.isUpToDate &&
+        ffmpegUpdateState.isUpToDate &&
+        (jsRuntimeUpdateState.isUpToDate || jsRuntimeStatus.name.lowercased() != "deno")
+    }
+
     public init(
         urlSession: URLSession = .shared,
         binDirectory: URL = EngineManager.managedBinDirectory
@@ -177,25 +230,20 @@ public final class EngineManager {
 
         async let ytdlpVer: String? = {
             guard let path = ytdlpFound?.0 else { return nil }
-            return await Self.readCommandFirstLine(executable: path, arguments: ["--version"])
+            let raw = await Self.readCommandFirstLine(executable: path, arguments: ["--version"])
+            return Self.normalizeVersion(raw, for: "yt-dlp")
         }()
 
         async let ffmpegVer: String? = {
             guard let path = ffmpegFound?.0 else { return nil }
-            guard let line = await Self.readCommandFirstLine(executable: path, arguments: ["-version"]) else {
-                return nil
-            }
-            // "ffmpeg version 7.1 Copyright ..." -> "7.1"
-            let tokens = line.split(separator: " ")
-            if tokens.count >= 3 && tokens[0] == "ffmpeg" && tokens[1] == "version" {
-                return String(tokens[2])
-            }
-            return line
+            let line = await Self.readCommandFirstLine(executable: path, arguments: ["-version"])
+            return Self.normalizeVersion(line, for: "ffmpeg")
         }()
 
         async let jsVer: String? = {
             guard let jsFound else { return nil }
-            return await Self.readCommandFirstLine(executable: jsFound.path, arguments: ["--version"])
+            let raw = await Self.readCommandFirstLine(executable: jsFound.path, arguments: ["--version"])
+            return Self.normalizeVersion(raw, for: jsFound.runtimeName)
         }()
 
         ytdlpStatus = BinaryStatus(
@@ -221,6 +269,212 @@ public final class EngineManager {
         } else {
             jsRuntimeStatus = BinaryStatus(name: "JS Runtime", path: nil, version: nil, source: .missing)
             ytdlpJSRuntimeArgument = nil
+        }
+
+        recomputeUpdateStates(
+            ytdlpLatest: ytdlpUpdateState.latestVersion,
+            ffmpegLatest: ffmpegUpdateState.latestVersion,
+            denoLatest: jsRuntimeStatus.name.lowercased() == "deno" ? jsRuntimeUpdateState.latestVersion : nil
+        )
+    }
+
+    /// Queries upstream release redirect headers (without downloading binary payloads) to report exact installed vs. latest versions.
+    public func checkForEngineUpdates() async {
+        guard !isCheckingUpdates else { return }
+        isCheckingUpdates = true
+        ytdlpUpdateState = .checking
+        ffmpegUpdateState = .checking
+        jsRuntimeUpdateState = .checking
+
+        defer {
+            isCheckingUpdates = false
+        }
+
+        #if arch(arm64)
+        let ffmpegArch = "arm64"
+        #else
+        let ffmpegArch = "amd64"
+        #endif
+
+        async let ytdlpLatest: String? = {
+            guard let url = URL(string: "https://github.com/yt-dlp/yt-dlp/releases/latest") else { return nil }
+            guard let loc = await fetchRedirectLocation(from: url) else { return nil }
+            return Self.parseLatestVersion(fromRedirectLocation: loc, for: "yt-dlp")
+        }()
+
+        async let ffmpegLatest: String? = {
+            guard let url = URL(string: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/\(ffmpegArch)/release/ffmpeg.zip") else { return nil }
+            guard let loc = await fetchRedirectLocation(from: url) else { return nil }
+            return Self.parseLatestVersion(fromRedirectLocation: loc, for: "ffmpeg")
+        }()
+
+        async let denoLatest: String? = {
+            guard let url = URL(string: "https://github.com/denoland/deno/releases/latest") else { return nil }
+            guard let loc = await fetchRedirectLocation(from: url) else { return nil }
+            return Self.parseLatestVersion(fromRedirectLocation: loc, for: "deno")
+        }()
+
+        let resolvedYTDLP = await ytdlpLatest
+        let resolvedFFmpeg = await ffmpegLatest
+        let resolvedDeno = await denoLatest
+
+        recomputeUpdateStates(
+            ytdlpLatest: resolvedYTDLP,
+            ffmpegLatest: resolvedFFmpeg,
+            denoLatest: resolvedDeno
+        )
+        lastUpdateCheckAt = Date()
+    }
+
+    private func recomputeUpdateStates(
+        ytdlpLatest: String?,
+        ffmpegLatest: String?,
+        denoLatest: String?
+    ) {
+        ytdlpUpdateState = Self.resolveUpdateState(status: ytdlpStatus, latest: ytdlpLatest)
+        ffmpegUpdateState = Self.resolveUpdateState(status: ffmpegStatus, latest: ffmpegLatest)
+
+        if jsRuntimeStatus.isInstalled && jsRuntimeStatus.name.lowercased() != "deno" {
+            // External Node/Bun/QuickJS runtimes are managed outside Deno release numbering.
+            if let installed = jsRuntimeStatus.version {
+                jsRuntimeUpdateState = .upToDate(latest: installed)
+            } else {
+                jsRuntimeUpdateState = .unknown
+            }
+        } else {
+            jsRuntimeUpdateState = Self.resolveUpdateState(status: jsRuntimeStatus, latest: denoLatest)
+        }
+    }
+
+    private nonisolated static func resolveUpdateState(status: BinaryStatus, latest: String?) -> EngineUpdateState {
+        guard status.isInstalled else {
+            return .notInstalled(latest: latest)
+        }
+        guard let installed = status.version, let latest else {
+            return .unknown
+        }
+        if compareVersions(installed, latest) == .orderedAscending {
+            return .updateAvailable(installed: installed, latest: latest)
+        }
+        return .upToDate(latest: latest)
+    }
+
+    /// Normalizes CLI `--version` strings into clean numeric version tokens (e.g. `9.1`, `2.9.8`, `2026.11.23`).
+    public nonisolated static func normalizeVersion(_ raw: String?, for engine: String) -> String? {
+        guard let raw else { return nil }
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+
+        let loweredEngine = engine.lowercased()
+        let knownPrefixes = [
+            "ffmpeg version ",
+            "ffprobe version ",
+            "\(loweredEngine) version ",
+            "\(loweredEngine) ",
+            "deno ",
+            "bun ",
+            "node ",
+            "quickjs "
+        ]
+        for prefix in knownPrefixes {
+            if cleaned.lowercased().hasPrefix(prefix) {
+                cleaned = String(cleaned.dropFirst(prefix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+
+        if (cleaned.hasPrefix("v") || cleaned.hasPrefix("V")) && cleaned.dropFirst().first?.isNumber == true {
+            cleaned = String(cleaned.dropFirst())
+        }
+
+        if let range = cleaned.range(of: #"^\d+(?:\.\d+)*"#, options: .regularExpression) {
+            return String(cleaned[range])
+        }
+
+        if let firstToken = cleaned.split(whereSeparator: \.isWhitespace).first {
+            return String(firstToken)
+        }
+        return cleaned
+    }
+
+    /// Compares dot-separated numeric versions semantically (`9.1` == `9.1.0`, `2.9.7` < `2.9.8`).
+    public nonisolated static func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let leftParts = lhs.split(separator: ".").map { Int($0) ?? 0 }
+        let rightParts = rhs.split(separator: ".").map { Int($0) ?? 0 }
+        let count = max(leftParts.count, rightParts.count)
+
+        for idx in 0..<count {
+            let l = idx < leftParts.count ? leftParts[idx] : 0
+            let r = idx < rightParts.count ? rightParts[idx] : 0
+            if l < r { return .orderedAscending }
+            if l > r { return .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    /// Extracts upstream version from release tag URLs or martin-riedl build paths.
+    public nonisolated static func parseLatestVersion(fromRedirectLocation location: String, for engine: String) -> String? {
+        let cleanedLocation = location
+            .split(separator: "#", maxSplits: 1).first.map(String.init) ?? location
+        let withoutQuery = cleanedLocation
+            .split(separator: "?", maxSplits: 1).first.map(String.init) ?? cleanedLocation
+
+        let lowered = engine.lowercased()
+        if lowered == "ffmpeg" || lowered == "ffprobe" {
+            let components = withoutQuery.split(separator: "/").map(String.init)
+            for component in components {
+                if let underscoreIndex = component.firstIndex(of: "_"),
+                   component[..<underscoreIndex].allSatisfy(\.isNumber) {
+                    let candidate = String(component[component.index(after: underscoreIndex)...])
+                    if let normalized = normalizeVersion(candidate, for: engine),
+                       normalized.first?.isNumber == true {
+                        return normalized
+                    }
+                }
+            }
+            if let range = withoutQuery.range(of: #"ffmpeg-(\d+(?:\.\d+)*)"#, options: .regularExpression) {
+                let matched = String(withoutQuery[range]).replacingOccurrences(of: "ffmpeg-", with: "")
+                return normalizeVersion(matched, for: engine)
+            }
+            return nil
+        }
+
+        if let tagRange = withoutQuery.range(of: "/tag/") {
+            let afterTag = String(withoutQuery[tagRange.upperBound...])
+            let tagToken = afterTag.split(separator: "/").first.map(String.init) ?? afterTag
+            return normalizeVersion(tagToken, for: engine)
+        }
+
+        if let last = withoutQuery.split(separator: "/").last.map(String.init) {
+            return normalizeVersion(last, for: engine)
+        }
+        return nil
+    }
+
+    private func fetchRedirectLocation(from url: URL) async -> String? {
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        request.setValue("Velora/2.0", forHTTPHeaderField: "User-Agent")
+
+        let delegate = NoRedirectTaskDelegate()
+        do {
+            let (_, response) = try await urlSession.data(for: request, delegate: delegate)
+            if let captured = delegate.redirectLocation, !captured.isEmpty {
+                return captured
+            }
+            if let http = response as? HTTPURLResponse,
+               let headerLocation = http.value(forHTTPHeaderField: "Location"),
+               !headerLocation.isEmpty {
+                return headerLocation
+            }
+            if let resolved = response.url?.absoluteString, resolved != url.absoluteString {
+                return resolved
+            }
+            return nil
+        } catch {
+            return nil
         }
     }
 
@@ -312,6 +566,47 @@ public final class EngineManager {
         } catch {
             lastError = error.localizedDescription
             installLogs.append("✗ Failed to install Deno: \(error.localizedDescription)")
+        }
+    }
+
+    /// Installs missing or outdated engines (`yt-dlp`, `ffmpeg` + `ffprobe`, and `deno`) while skipping ones already up to date.
+    public func installMissingOrOutdatedManagedEngines() async {
+        guard !isWorking else { return }
+        isWorking = true
+        lastError = nil
+
+        defer {
+            isWorking = false
+            activityMessage = ""
+        }
+
+        do {
+            if !ytdlpStatus.isInstalled || ytdlpUpdateState.needsUpdate || ytdlpUpdateState == .unknown {
+                activityMessage = "Downloading official yt-dlp_macos binary…"
+                try await performInstallYTDLP()
+            } else if let ver = ytdlpStatus.version {
+                installLogs.append("✓ yt-dlp is already up to date (\(ver)), skipping.")
+            }
+
+            if !ffmpegStatus.isInstalled || ffmpegUpdateState.needsUpdate || ffmpegUpdateState == .unknown {
+                activityMessage = "Downloading official FFmpeg & FFprobe binaries…"
+                try await performInstallFFmpeg()
+            } else if let ver = ffmpegStatus.version {
+                installLogs.append("✓ ffmpeg is already up to date (\(ver)), skipping.")
+            }
+
+            if !jsRuntimeStatus.isInstalled || jsRuntimeUpdateState.needsUpdate || (jsRuntimeStatus.name.lowercased() == "deno" && jsRuntimeUpdateState == .unknown) {
+                activityMessage = "Downloading Deno JS runtime…"
+                try await performInstallDeno()
+            } else if let ver = jsRuntimeStatus.version {
+                installLogs.append("✓ \(jsRuntimeStatus.name) is already up to date (\(ver)), skipping.")
+            }
+
+            await refresh()
+        } catch {
+            lastError = error.localizedDescription
+            installLogs.append("✗ Engine update failed: \(error.localizedDescription)")
+            await refresh()
         }
     }
 
@@ -464,9 +759,7 @@ public final class EngineManager {
 
         let (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw AppUpdateInstallError.missingChecksumManifest
-                as Error? ?? NSError(domain: "Velora.EngineManager", code: code)
         }
         guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
             throw AppUpdateInstallError.missingChecksumManifest
@@ -794,5 +1087,32 @@ public final class EngineManager {
                 }
             }
         }
+    }
+}
+
+private final class NoRedirectTaskDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var capturedLocation: String?
+
+    var redirectLocation: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedLocation
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let location = request.url?.absoluteString ?? response.value(forHTTPHeaderField: "Location")
+        lock.lock()
+        if capturedLocation == nil {
+            capturedLocation = location
+        }
+        lock.unlock()
+        completionHandler(nil)
     }
 }

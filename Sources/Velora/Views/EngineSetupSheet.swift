@@ -6,13 +6,24 @@ struct EngineSetupSheet: View {
     let engineManager: EngineManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     @State private var copiedLog = false
     @State private var copiedBrew = false
 
-    private var allInstalled: Bool {
-        engineManager.ytdlpStatus.isInstalled &&
-        engineManager.ffmpegStatus.isInstalled &&
-        engineManager.jsRuntimeStatus.isInstalled
+    private var actionNeededCount: Int {
+        var count = 0
+        if !engineManager.ytdlpStatus.isInstalled || engineManager.ytdlpUpdateState.needsUpdate { count += 1 }
+        if !engineManager.ffmpegStatus.isInstalled || engineManager.ffmpegUpdateState.needsUpdate { count += 1 }
+        if !engineManager.jsRuntimeStatus.isInstalled || engineManager.jsRuntimeUpdateState.needsUpdate { count += 1 }
+        return count
+    }
+
+    private var jsRuntimeCardTitle: String {
+        let name = engineManager.jsRuntimeStatus.name
+        if engineManager.jsRuntimeStatus.isInstalled && name.lowercased() != "deno" && name != "JS Runtime" {
+            return "\(name.capitalized) JS Runtime"
+        }
+        return "Deno JS Runtime"
     }
 
     var body: some View {
@@ -20,36 +31,36 @@ struct EngineSetupSheet: View {
             headerSection
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 205), spacing: 12, alignment: .top)],
-                        spacing: 12
-                    ) {
-                        engineCard(
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(spacing: 10) {
+                        engineRow(
                             title: "yt-dlp",
                             status: engineManager.ytdlpStatus,
+                            updateState: engineManager.ytdlpUpdateState,
                             description: "Core media extractor for YouTube, Vimeo, X, TikTok, Twitch & 1,000+ sites.",
-                            actionTitle: engineManager.ytdlpStatus.isInstalled ? "Update yt-dlp" : "Install yt-dlp",
+                            installLabel: "Install",
                             isRequired: true
                         ) {
                             Task { await engineManager.installOrUpdateManagedYTDLP() }
                         }
 
-                        engineCard(
+                        engineRow(
                             title: "FFmpeg & FFprobe",
                             status: engineManager.ffmpegStatus,
-                            description: "Zero-Homebrew standalone builds for 4K muxing, MP3/FLAC, & subtitles.",
-                            actionTitle: engineManager.ffmpegStatus.isInstalled ? "Update FFmpeg" : "Install FFmpeg",
+                            updateState: engineManager.ffmpegUpdateState,
+                            description: "Zero-Homebrew standalone builds for 4K muxing, MP3/FLAC extraction, and subtitles.",
+                            installLabel: "Install",
                             isRequired: true
                         ) {
                             Task { await engineManager.installOrUpdateManagedFFmpeg() }
                         }
 
-                        engineCard(
-                            title: "Deno JS Runtime",
+                        engineRow(
+                            title: jsRuntimeCardTitle,
                             status: engineManager.jsRuntimeStatus,
-                            description: "Zero-Homebrew standalone runtime for YouTube 4K/EJS stream challenges.",
-                            actionTitle: engineManager.jsRuntimeStatus.isInstalled ? "Update Deno" : "Install Deno",
+                            updateState: engineManager.jsRuntimeUpdateState,
+                            description: "Zero-Homebrew standalone JS runtime for YouTube 4K/EJS stream challenges.",
+                            installLabel: "Install",
                             isRequired: false
                         ) {
                             Task { await engineManager.installOrUpdateManagedDeno() }
@@ -100,8 +111,12 @@ struct EngineSetupSheet: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 540, idealWidth: 760, maxWidth: 920, minHeight: 420, idealHeight: 540)
+        .frame(minWidth: 620, idealWidth: 760, maxWidth: 920, minHeight: 460, idealHeight: 580)
         .background(VeloraTheme.ground)
+        .task {
+            await engineManager.refresh()
+            await engineManager.checkForEngineUpdates()
+        }
     }
 
     private var headerSection: some View {
@@ -127,7 +142,7 @@ struct EngineSetupSheet: View {
                         icon: "checkmark.shield.fill"
                     )
                 }
-                Text("Install standalone, cryptographically verified binaries into Velora's Application Support bin folder with zero Homebrew required.")
+                Text("Install and keep yt-dlp, FFmpeg & FFprobe, and Deno up to date with zero Homebrew required.")
                     .font(.caption)
                     .foregroundStyle(VeloraTheme.inkSecondary)
             }
@@ -136,83 +151,293 @@ struct EngineSetupSheet: View {
         }
     }
 
-    private func engineCard(
+    private func engineRow(
         title: String,
         status: BinaryStatus,
+        updateState: EngineUpdateState,
         description: String,
-        actionTitle: String,
+        installLabel: String,
         isRequired: Bool,
         action: @escaping () -> Void
     ) -> some View {
-        let statusColor: Color = status.isInstalled
-            ? VeloraTheme.success
-            : (isRequired ? VeloraTheme.danger : VeloraTheme.warning)
+        let toneColor = rowStatusColor(status: status, updateState: updateState, isRequired: isRequired)
+        let isExternalNonDeno = title != "Deno JS Runtime" && status.isInstalled && status.name.lowercased() != "deno"
 
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: status.isInstalled ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                    .foregroundStyle(statusColor)
-                    .accessibilityHidden(true)
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(VeloraTheme.inkPrimary)
-                    .lineLimit(1)
-                Spacer()
-                VeloraBadge(
-                    text: status.source.label,
-                    color: statusColor
-                )
+        return HStack(alignment: .center, spacing: 14) {
+            leadingStatusIcon(status: status, updateState: updateState, toneColor: toneColor)
+
+            VStack(alignment: .leading, spacing: 5) {
+                FlowWrapLayout(alignment: .leading, spacing: 7, lineSpacing: 4) {
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(VeloraTheme.inkPrimary)
+                        .fixedSize()
+
+                    VeloraBadge(
+                        text: status.source.label,
+                        color: status.isInstalled ? VeloraTheme.inkSecondary : toneColor
+                    )
+
+                    updateStatusBadge(
+                        status: status,
+                        updateState: updateState,
+                        isRequired: isRequired,
+                        isExternalNonDeno: isExternalNonDeno
+                    )
+                }
+
+                Text(description)
+                    .font(.caption)
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                    .lineLimit(2)
+
+                HStack(spacing: 8) {
+                    versionComparisonText(
+                        status: status,
+                        updateState: updateState,
+                        isExternalNonDeno: isExternalNonDeno
+                    )
+
+                    if let path = status.path {
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.5))
+                        Text(abbreviateHomePath(path))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.75))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
             }
 
-            Text(description)
-                .font(.caption)
-                .foregroundStyle(VeloraTheme.inkSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
 
-            VStack(alignment: .leading, spacing: 2) {
-                if let version = status.version {
-                    Text("Version \(version)")
+            rowActionButton(
+                title: title,
+                status: status,
+                updateState: updateState,
+                installLabel: installLabel,
+                action: action
+            )
+        }
+        .veloraCard(padding: 14, cornerRadius: 14)
+        .overlay {
+            if updateState.needsUpdate {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(VeloraTheme.accent.opacity(0.45), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func leadingStatusIcon(
+        status: BinaryStatus,
+        updateState: EngineUpdateState,
+        toneColor: Color
+    ) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(toneColor.opacity(colorScheme == .dark ? 0.16 : 0.08))
+            if case .checking = updateState {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                let symbol: String = {
+                    if !status.isInstalled { return "exclamationmark.circle.fill" }
+                    if updateState.needsUpdate { return "arrow.up.circle.fill" }
+                    return "checkmark.circle.fill"
+                }()
+                Image(systemName: symbol)
+                    .font(.title3)
+                    .foregroundStyle(toneColor)
+            }
+        }
+        .frame(width: 38, height: 38)
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func updateStatusBadge(
+        status: BinaryStatus,
+        updateState: EngineUpdateState,
+        isRequired: Bool,
+        isExternalNonDeno: Bool
+    ) -> some View {
+        switch updateState {
+        case .checking:
+            VeloraBadge(text: "Checking…", color: VeloraTheme.inkSecondary)
+        case .upToDate:
+            VeloraBadge(
+                text: isExternalNonDeno ? "External ready" : "Up to date",
+                color: VeloraTheme.success,
+                icon: "checkmark"
+            )
+        case .updateAvailable(_, let latest):
+            VeloraBadge(
+                text: "Update available · \(latest)",
+                color: VeloraTheme.accentText,
+                icon: "arrow.up.circle"
+            )
+        case .notInstalled:
+            VeloraBadge(
+                text: isRequired ? "Required" : "Optional",
+                color: isRequired ? VeloraTheme.danger : VeloraTheme.warning
+            )
+        case .unknown:
+            if status.isInstalled {
+                VeloraBadge(text: "Installed", color: VeloraTheme.success, icon: "checkmark")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func versionComparisonText(
+        status: BinaryStatus,
+        updateState: EngineUpdateState,
+        isExternalNonDeno: Bool
+    ) -> some View {
+        switch updateState {
+        case .upToDate(let latest):
+            if let installed = status.version {
+                if isExternalNonDeno {
+                    Text("Installed \(installed)")
                         .font(.caption.monospacedDigit().weight(.medium))
                         .foregroundStyle(VeloraTheme.inkPrimary)
                 } else {
-                    Text("Not detected")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(VeloraTheme.inkSecondary)
-                }
-
-                if let path = status.path {
-                    Text(path)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.75))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 5) {
+                        Text("Installed \(installed)")
+                            .foregroundStyle(VeloraTheme.inkPrimary)
+                        Text("·")
+                            .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.6))
+                        Text("Latest \(latest)")
+                            .foregroundStyle(VeloraTheme.success)
+                    }
+                    .font(.caption.monospacedDigit().weight(.medium))
                 }
             }
+        case .updateAvailable(let installed, let latest):
+            HStack(spacing: 5) {
+                Text("Installed \(installed)")
+                    .foregroundStyle(VeloraTheme.inkPrimary)
+                Text("→")
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                Text("Latest \(latest)")
+                    .foregroundStyle(VeloraTheme.accentText)
+            }
+            .font(.caption.monospacedDigit().weight(.semibold))
+        case .notInstalled(let latest):
+            HStack(spacing: 5) {
+                Text("Not installed")
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                if let latest {
+                    Text("·")
+                        .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.6))
+                    Text("Latest \(latest)")
+                        .foregroundStyle(VeloraTheme.inkSecondary)
+                }
+            }
+            .font(.caption.monospacedDigit().weight(.medium))
+        case .checking, .unknown:
+            if let installed = status.version {
+                Text("Installed \(installed)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(VeloraTheme.inkPrimary)
+            } else {
+                Text("Not detected")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+            }
+        }
+    }
 
-            Spacer(minLength: 0)
-
-            Button(actionTitle, action: action)
+    @ViewBuilder
+    private func rowActionButton(
+        title: String,
+        status: BinaryStatus,
+        updateState: EngineUpdateState,
+        installLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        if !status.isInstalled {
+            let label = updateState.latestVersion.map { "Install \($0)" } ?? installLabel
+            Button(label, action: action)
+                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: engineManager.isWorking))
+                .controlSize(.small)
+                .disabled(engineManager.isWorking)
+                .accessibilityLabel("Install \(title)")
+        } else if case .updateAvailable(_, let latest) = updateState {
+            Button("Update to \(latest)", action: action)
+                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: engineManager.isWorking))
+                .controlSize(.small)
+                .disabled(engineManager.isWorking)
+                .accessibilityLabel("Update \(title) to \(latest)")
+        } else if updateState.isUpToDate {
+            Button("Reinstall", action: action)
                 .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking))
                 .controlSize(.small)
                 .disabled(engineManager.isWorking)
+                .accessibilityLabel("Reinstall \(title)")
+        } else {
+            Button("Update", action: action)
+                .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking))
+                .controlSize(.small)
+                .disabled(engineManager.isWorking)
+                .accessibilityLabel("Update \(title)")
         }
-        .frame(maxWidth: .infinity, minHeight: 158, maxHeight: .infinity, alignment: .topLeading)
-        .veloraCard(padding: 14, cornerRadius: 14)
     }
 
     private var bulkActionsCard: some View {
         VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                overallSummaryBanner
+                Spacer()
+                if let checkedAt = engineManager.lastUpdateCheckAt, !engineManager.isCheckingUpdates {
+                    Text("Checked \(checkedAt.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(VeloraTheme.inkSecondary.opacity(0.75))
+                }
+            }
+
             FlowWrapLayout(alignment: .leading, spacing: 10, lineSpacing: 8) {
+                if actionNeededCount > 0 {
+                    Button {
+                        Task { await engineManager.installMissingOrOutdatedManagedEngines() }
+                    } label: {
+                        Label(
+                            smartBulkButtonTitle,
+                            systemImage: "arrow.down.circle.fill"
+                        )
+                        .monospacedDigit()
+                    }
+                    .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: engineManager.isWorking))
+                    .disabled(engineManager.isWorking)
+                }
+
                 Button {
-                    Task { await engineManager.installAllManagedEngines() }
+                    Task {
+                        await engineManager.refresh()
+                        await engineManager.checkForEngineUpdates()
+                    }
                 } label: {
                     Label(
-                        allInstalled ? "Update All Managed Engines" : "Install Missing Engines",
-                        systemImage: "arrow.down.circle.fill"
+                        engineManager.isCheckingUpdates ? "Checking…" : "Check for Updates",
+                        systemImage: "arrow.clockwise"
                     )
                 }
-                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: engineManager.isWorking))
-                .disabled(engineManager.isWorking)
+                .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking || engineManager.isCheckingUpdates))
+                .disabled(engineManager.isWorking || engineManager.isCheckingUpdates)
+
+                if actionNeededCount == 0 && engineManager.allEnginesUpToDate {
+                    Button {
+                        Task { await engineManager.installAllManagedEngines() }
+                    } label: {
+                        Label("Reinstall All", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking))
+                    .disabled(engineManager.isWorking)
+                }
 
                 if engineManager.homebrewPath != nil {
                     Button {
@@ -232,14 +457,6 @@ struct EngineSetupSheet: View {
                     .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking))
                     .disabled(engineManager.isWorking)
                 }
-
-                Button {
-                    Task { await engineManager.refresh() }
-                } label: {
-                    Label("Re-scan", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: engineManager.isWorking))
-                .disabled(engineManager.isWorking)
             }
 
             HStack(spacing: 8) {
@@ -272,6 +489,77 @@ struct EngineSetupSheet: View {
             }
         }
         .veloraCard(padding: 14, cornerRadius: 14)
+    }
+
+    @ViewBuilder
+    private var overallSummaryBanner: some View {
+        let missing = engineManager.missingEngineCount
+        let outdated = engineManager.outdatedEngineCount
+
+        if engineManager.isCheckingUpdates {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Checking latest upstream versions…")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+            }
+        } else if missing > 0 && outdated > 0 {
+            Label("\(missing) missing, \(outdated) update\(outdated == 1 ? "" : "s") available", systemImage: "exclamationmark.circle.fill")
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .foregroundStyle(VeloraTheme.warning)
+        } else if missing > 0 {
+            Label("\(missing) engine\(missing == 1 ? "" : "s") missing", systemImage: "exclamationmark.circle.fill")
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .foregroundStyle(VeloraTheme.danger)
+        } else if outdated > 0 {
+            Label("\(outdated) engine update\(outdated == 1 ? "" : "s") available", systemImage: "arrow.up.circle.fill")
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .foregroundStyle(VeloraTheme.accentText)
+        } else if engineManager.allEnginesUpToDate {
+            Label("All engines are up to date", systemImage: "checkmark.seal.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(VeloraTheme.success)
+        } else {
+            Label("Installed engines verified", systemImage: "checkmark.circle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(VeloraTheme.success)
+        }
+    }
+
+    private var smartBulkButtonTitle: String {
+        let missing = engineManager.missingEngineCount
+        let outdated = engineManager.outdatedEngineCount
+        if missing > 0 && outdated == 0 {
+            return "Install Missing (\(missing))"
+        }
+        if outdated > 0 && missing == 0 {
+            return "Update Outdated (\(outdated))"
+        }
+        return "Install & Update (\(actionNeededCount))"
+    }
+
+    private func rowStatusColor(
+        status: BinaryStatus,
+        updateState: EngineUpdateState,
+        isRequired: Bool
+    ) -> Color {
+        if !status.isInstalled {
+            return isRequired ? VeloraTheme.danger : VeloraTheme.warning
+        }
+        if updateState.needsUpdate {
+            return VeloraTheme.accentText
+        }
+        return VeloraTheme.success
+    }
+
+    private func abbreviateHomePath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") {
+            return "~/" + path.dropFirst(home.count + 1)
+        }
+        return path
     }
 
     private var verificationLogSection: some View {
