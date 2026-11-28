@@ -10,8 +10,10 @@ struct PlaylistPickerSheet: View {
     @State private var selectedIDs: Set<String> = []
     @State private var searchQuery: String = ""
     @State private var rangeExpression: String = ""
+    @State private var rangeFeedback: String? = nil
     @State private var createSubfolder: Bool
     @State private var prefixIndex: Bool = true
+    @FocusState private var isSearchFocused: Bool
 
     init(
         mediaInfo: MediaInfo,
@@ -44,104 +46,148 @@ struct PlaylistPickerSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // Header
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .fill(VeloraTheme.brandGradient)
-                        .frame(width: 42, height: 42)
-                    Image(systemName: "list.bullet.rectangle.portrait.fill")
-                        .font(.title3)
-                        .foregroundStyle(.white)
-                }
+            headerSection
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(mediaInfo.title)
-                        .font(.title3.weight(.bold))
-                        .lineLimit(1)
+            toolbarSection
 
-                    HStack(spacing: 8) {
-                        VeloraBadge(
-                            text: "\(selectedIDs.count) of \(mediaInfo.playlistEntries.count) selected",
-                            color: VeloraTheme.violet,
-                            icon: "checkmark.circle"
-                        )
-                        if let totalDuration = mediaInfo.totalPlaylistDurationFormatted {
-                            VeloraBadge(text: totalDuration, color: VeloraTheme.cyan, icon: "clock")
-                        }
-                        if unavailableCount > 0 {
-                            VeloraBadge(text: "\(unavailableCount) unavailable", color: .orange, icon: "eye.slash")
-                        }
-                        if let uploader = mediaInfo.uploader {
-                            Text(uploader)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-                Spacer()
+            if let rangeFeedback {
+                Text(rangeFeedback)
+                    .font(.caption)
+                    .foregroundStyle(VeloraTheme.warning)
             }
 
-            // Search + Selection Toolbar
-            HStack(spacing: 10) {
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("Filter by title, channel, or #…", text: $searchQuery)
-                        .textFieldStyle(.plain)
-                    if !searchQuery.isEmpty {
-                        Button {
-                            searchQuery = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.tertiary)
-                        }
-                        .buttonStyle(.plain)
+            entriesListSection
+
+            bottomBar
+        }
+        .padding(20)
+        .frame(minWidth: 620, idealWidth: 860, maxWidth: 1140, minHeight: 460, idealHeight: 600, maxHeight: 820)
+        .background(VeloraTheme.ground)
+        .onAppear {
+            selectedIDs = Set(mediaInfo.availablePlaylistEntries.map(\.id))
+        }
+        .onChange(of: rangeExpression) { _, _ in
+            rangeFeedback = nil
+        }
+    }
+
+    private var headerSection: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(VeloraTheme.accent)
+                    .frame(width: 42, height: 42)
+                Image(systemName: "list.bullet.rectangle.portrait.fill")
+                    .font(.title3)
+                    .foregroundStyle(.white)
+                    .accessibilityHidden(true)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(mediaInfo.title)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(VeloraTheme.inkPrimary)
+                    .lineLimit(1)
+
+                HStack(spacing: 8) {
+                    VeloraBadge(
+                        text: "\(selectedIDs.count) of \(mediaInfo.playlistEntries.count) selected",
+                        color: VeloraTheme.accentText,
+                        icon: "checkmark.circle"
+                    )
+                    if let totalDuration = mediaInfo.totalPlaylistDurationFormatted {
+                        VeloraBadge(text: totalDuration, color: VeloraTheme.info, icon: "clock")
+                    }
+                    if unavailableCount > 0 {
+                        VeloraBadge(text: "\(unavailableCount) unavailable", color: VeloraTheme.warning, icon: "eye.slash")
+                    }
+                    if let uploader = mediaInfo.uploader {
+                        Text(uploader)
+                            .font(.caption)
+                            .foregroundStyle(VeloraTheme.inkSecondary)
+                            .lineLimit(1)
                     }
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(VeloraTheme.subtleCardBorder, lineWidth: 1)
-                )
+            }
 
-                HStack(spacing: 6) {
-                    TextField("Range (e.g. 1-10, 15)", text: $rangeExpression)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 155)
-                        .onSubmit { applyRangeSelection() }
+            Spacer()
+        }
+    }
 
-                    Button("Apply") {
-                        applyRangeSelection()
+    private var toolbarSection: some View {
+        FlowWrapLayout(alignment: .leading, spacing: 10, lineSpacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                    .accessibilityHidden(true)
+                TextField("Filter by title, channel, or #…", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                    .foregroundStyle(VeloraTheme.inkPrimary)
+                    .focused($isSearchFocused)
+                    .accessibilityLabel("Filter playlist videos")
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(VeloraTheme.inkSecondary)
+                            .frame(minWidth: 24, minHeight: 24)
+                            .contentShape(Rectangle())
+                            .accessibilityHidden(true)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(rangeExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .buttonStyle(.plain)
+                    .veloraFocusableRing(cornerRadius: 999)
+                    .accessibilityLabel("Clear search filter")
                 }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(minWidth: 200, maxWidth: 280)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(VeloraTheme.surfaceElevated)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(VeloraTheme.hairline, lineWidth: 1)
+            )
+            .veloraFocusRing(isFocused: isSearchFocused, cornerRadius: 8)
 
-                Divider()
-                    .frame(height: 18)
+            HStack(spacing: 6) {
+                TextField("Range (e.g. 1-10, 15)", text: $rangeExpression)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.callout, design: .monospaced))
+                    .frame(width: 155)
+                    .onSubmit { applyRangeSelection() }
+                    .accessibilityLabel("Playlist item range")
 
+                Button("Apply") {
+                    applyRangeSelection()
+                }
+                .buttonStyle(VeloraSecondaryButtonStyle(isDisabled: rangeExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                .controlSize(.small)
+                .disabled(rangeExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            HStack(spacing: 6) {
                 Button("All") {
                     for entry in filteredEntries where !entry.isUnavailable {
                         selectedIDs.insert(entry.id)
                     }
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(VeloraSecondaryButtonStyle())
                 .controlSize(.small)
+                .accessibilityLabel("Select all visible videos")
 
                 Button("None") {
                     for entry in filteredEntries {
                         selectedIDs.remove(entry.id)
                     }
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(VeloraSecondaryButtonStyle())
                 .controlSize(.small)
+                .accessibilityLabel("Deselect all visible videos")
 
                 Button("Invert") {
                     for entry in filteredEntries where !entry.isUnavailable {
@@ -152,171 +198,190 @@ struct PlaylistPickerSheet: View {
                         }
                     }
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(VeloraSecondaryButtonStyle())
                 .controlSize(.small)
-            }
-
-            // Entries list
-            ScrollView {
-                LazyVStack(spacing: 6) {
-                    ForEach(filteredEntries) { entry in
-                        PlaylistEntryRow(
-                            entry: entry,
-                            isSelected: selectedIDs.contains(entry.id),
-                            onToggle: {
-                                if selectedIDs.contains(entry.id) {
-                                    selectedIDs.remove(entry.id)
-                                } else {
-                                    selectedIDs.insert(entry.id)
-                                }
-                            }
-                        )
-                    }
-                }
-                .padding(8)
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.7))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(VeloraTheme.subtleCardBorder, lineWidth: 1)
-            )
-
-            // Bottom options & CTA
-            HStack(spacing: 16) {
-                Toggle("Create playlist subfolder", isOn: $createSubfolder)
-                    .font(.callout)
-                Toggle("Number files (01 - Title)", isOn: $prefixIndex)
-                    .font(.callout)
-
-                Spacer()
-
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-
-                Button {
-                    let chosen = selectedEntriesOrdered
-                    guard !chosen.isEmpty else { return }
-                    onQueueSelected(chosen, createSubfolder, prefixIndex)
-                    dismiss()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Queue \(selectedIDs.count) Video\(selectedIDs.count == 1 ? "" : "s")")
-                    }
-                }
-                .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: selectedIDs.isEmpty))
-                .disabled(selectedIDs.isEmpty)
-                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel("Invert visible video selection")
             }
         }
-        .padding(20)
-        .frame(width: 820, height: 580)
-        .onAppear {
-            selectedIDs = Set(mediaInfo.availablePlaylistEntries.map(\.id))
+    }
+
+    @ViewBuilder
+    private var entriesListSection: some View {
+        Group {
+            if filteredEntries.isEmpty {
+                ContentUnavailableView(
+                    "No Matching Videos",
+                    systemImage: "magnifyingglass",
+                    description: Text("No playlist entries match \"\(searchQuery)\".")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(filteredEntries) { entry in
+                            PlaylistEntryRow(
+                                entry: entry,
+                                isSelected: selectedIDs.contains(entry.id),
+                                onToggle: { isOn in
+                                    guard !entry.isUnavailable else { return }
+                                    if isOn {
+                                        selectedIDs.insert(entry.id)
+                                    } else {
+                                        selectedIDs.remove(entry.id)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(VeloraTheme.surfaceElevated)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(VeloraTheme.hairline, lineWidth: 1)
+        )
+    }
+
+    private var bottomBar: some View {
+        HStack(spacing: 16) {
+            Toggle("Create playlist subfolder", isOn: $createSubfolder)
+                .font(.callout)
+                .foregroundStyle(VeloraTheme.inkPrimary)
+
+            Toggle("Number files (01 - Title)", isOn: $prefixIndex)
+                .font(.callout)
+                .foregroundStyle(VeloraTheme.inkPrimary)
+
+            Spacer()
+
+            Button("Cancel") { dismiss() }
+                .buttonStyle(VeloraSecondaryButtonStyle())
+                .keyboardShortcut(.cancelAction)
+
+            Button {
+                let chosen = selectedEntriesOrdered
+                guard !chosen.isEmpty else { return }
+                onQueueSelected(chosen, createSubfolder, prefixIndex)
+                dismiss()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .accessibilityHidden(true)
+                    Text("Queue \(selectedIDs.count) Video\(selectedIDs.count == 1 ? "" : "s")")
+                        .monospacedDigit()
+                }
+            }
+            .buttonStyle(VeloraPrimaryButtonStyle(isDisabled: selectedIDs.isEmpty))
+            .disabled(selectedIDs.isEmpty)
+            .keyboardShortcut(.defaultAction)
         }
     }
 
     private func applyRangeSelection() {
+        let trimmed = rangeExpression.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
         let indices = PlaylistURLDetector.parseSelectionRange(
-            rangeExpression,
+            trimmed,
             maxIndex: mediaInfo.playlistEntries.count
         )
-        guard !indices.isEmpty else { return }
-        selectedIDs = Set(
-            mediaInfo.playlistEntries
-                .filter { indices.contains($0.index) && !$0.isUnavailable }
-                .map(\.id)
-        )
+        let matched = mediaInfo.playlistEntries.filter { indices.contains($0.index) && !$0.isUnavailable }
+
+        guard !matched.isEmpty else {
+            rangeFeedback = "No available items matched range \"\(trimmed)\" (valid range: 1–\(mediaInfo.playlistEntries.count))."
+            return
+        }
+
+        rangeFeedback = nil
+        selectedIDs = Set(matched.map(\.id))
     }
 }
 
 private struct PlaylistEntryRow: View {
     let entry: PlaylistEntry
     let isSelected: Bool
-    let onToggle: () -> Void
+    let onToggle: (Bool) -> Void
 
     var body: some View {
-        Button(action: onToggle) {
-            HStack(spacing: 10) {
-                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                    .font(.body)
-                    .foregroundStyle(isSelected ? VeloraTheme.violet : .secondary)
+        HStack(spacing: 10) {
+            Toggle(
+                entry.title,
+                isOn: Binding(
+                    get: { isSelected },
+                    set: { onToggle($0) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+            .disabled(entry.isUnavailable)
+            .accessibilityLabel("Select #\(entry.index) \(entry.title)")
+            .accessibilityValue(entry.isUnavailable ? "Unavailable" : (isSelected ? "Selected" : "Not selected"))
 
-                Text(String(format: "#%02d", entry.index))
-                    .font(.system(.caption, design: .monospaced, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 38, alignment: .leading)
+            Text(String(format: "#%02d", entry.index))
+                .font(.system(.caption, design: .monospaced, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(VeloraTheme.inkSecondary)
+                .frame(width: 38, alignment: .leading)
 
-                thumbnail
-                    .frame(width: 64, height: 36)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            CachedThumbnailView(
+                urlString: entry.thumbnailURL,
+                width: 64,
+                height: 36,
+                cornerRadius: 6,
+                maxPixelSize: 160,
+                fallbackSymbol: "play.fill"
+            )
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(entry.title)
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(entry.isUnavailable ? .secondary : .primary)
-                        .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.title)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(entry.isUnavailable ? VeloraTheme.inkSecondary : VeloraTheme.inkPrimary)
+                    .lineLimit(1)
 
-                    HStack(spacing: 8) {
-                        if let uploader = entry.uploader {
-                            Text(uploader)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        if entry.isUnavailable {
-                            VeloraBadge(text: "Unavailable", color: .orange)
-                        }
+                HStack(spacing: 8) {
+                    if let uploader = entry.uploader {
+                        Text(uploader)
+                            .font(.caption2)
+                            .foregroundStyle(VeloraTheme.inkSecondary)
+                            .lineLimit(1)
+                    }
+                    if entry.isUnavailable {
+                        VeloraBadge(text: "Unavailable", color: VeloraTheme.warning)
                     }
                 }
-
-                Spacer()
-
-                if let duration = entry.formattedDuration {
-                    Text(duration)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
-                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? VeloraTheme.violet.opacity(0.09) : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
 
-    @ViewBuilder
-    private var thumbnail: some View {
-        if let thumbStr = entry.thumbnailURL, let url = URL(string: thumbStr) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fill)
-                default:
-                    placeholder
-                }
+            Spacer()
+
+            if let duration = entry.formattedDuration {
+                Text(duration)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(VeloraTheme.surfaceSubtle)
+                    )
             }
-        } else {
-            placeholder
         }
-    }
-
-    private var placeholder: some View {
-        ZStack {
-            Color.secondary.opacity(0.14)
-            Image(systemName: "play.fill")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected && !entry.isUnavailable ? VeloraTheme.accent.opacity(0.08) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !entry.isUnavailable else { return }
+            onToggle(!isSelected)
         }
+        .disabled(entry.isUnavailable)
     }
 }

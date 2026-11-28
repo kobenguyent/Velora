@@ -2,9 +2,50 @@ import AppKit
 import SwiftUI
 import VeloraCore
 
+enum AppSection: String, CaseIterable, Identifiable {
+    case studio
+    case queue
+    case history
+    case presets
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .studio: "Studio"
+        case .queue: "Queue"
+        case .history: "History"
+        case .presets: "Presets"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .studio: "sparkles.rectangle.stack"
+        case .queue: "arrow.down.circle"
+        case .history: "clock.arrow.circlepath"
+        case .presets: "slider.horizontal.3"
+        }
+    }
+}
+
+enum ToastKind: Sendable, Equatable {
+    case success
+    case warning
+    case error
+    case info
+}
+
+struct ToastItem: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let message: String
+    let kind: ToastKind
+}
+
 @main
 struct VeloraApp: App {
     @NSApplicationDelegateAdaptor(VeloraAppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
 
     @State private var engineManager: EngineManager
     @State private var downloadManager: DownloadManager
@@ -25,21 +66,28 @@ struct VeloraApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Velora") {
+        Window("Velora", id: "main") {
             MainWindowView(
                 engineManager: engineManager,
                 downloadManager: downloadManager,
                 updateChecker: updateChecker,
                 studio: studioState
             )
-            .frame(minWidth: 960, minHeight: 640)
+            .tint(VeloraTheme.accent)
+            .frame(minWidth: 680, minHeight: 500)
             .task {
+                configureAppLifecycle()
+                MacSystemBridge.shared.requestNotificationPermissionIfBundled()
                 await engineManager.refresh()
+                downloadManager.restorePendingQueueAfterEngineReady()
                 await updateChecker.performLaunchCheckIfEnabled()
             }
+            .onOpenURL { url in
+                handleDeepLink(url)
+            }
         }
-        .windowToolbarStyle(.unified)
-        .defaultSize(width: 1120, height: 740)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1040, height: 680)
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
@@ -50,12 +98,59 @@ struct VeloraApp: App {
                 .keyboardShortcut("u", modifiers: [.command, .shift])
 
                 Button("Engine Setup…") {
+                    openMainWindow()
                     studioState.isShowingEngineSetup = true
                 }
             }
 
+            CommandMenu("Navigate") {
+                Button("Open Velora") {
+                    openMainWindow()
+                }
+                .keyboardShortcut("0", modifiers: [.command])
+
+                Divider()
+
+                Button("Studio") {
+                    studioState.selectedSection = .studio
+                }
+                .keyboardShortcut("1", modifiers: [.command])
+
+                Button("Queue") {
+                    studioState.selectedSection = .queue
+                }
+                .keyboardShortcut("2", modifiers: [.command])
+
+                Button("History") {
+                    studioState.selectedSection = .history
+                }
+                .keyboardShortcut("3", modifiers: [.command])
+
+                Button("Presets") {
+                    studioState.selectedSection = .presets
+                }
+                .keyboardShortcut("4", modifiers: [.command])
+            }
+
             CommandMenu("Downloads") {
+                Button("Focus URL Input") {
+                    openMainWindow()
+                    studioState.selectedSection = .studio
+                    studioState.focusURLRequestToken = UUID()
+                }
+                .keyboardShortcut("l", modifiers: [.command])
+
+                Button("Inspect URL") {
+                    openMainWindow()
+                    studioState.selectedSection = .studio
+                    studioState.startInspectingCurrentURL(engineManager: engineManager)
+                }
+                .keyboardShortcut("i", modifiers: [.command])
+                .disabled(!studioState.canDownload || studioState.isBatchMode)
+
                 Button("Paste URL & Inspect") {
+                    openMainWindow()
+                    studioState.selectedSection = .studio
                     studioState.pasteFromClipboardAndInspect(engineManager: engineManager)
                 }
                 .keyboardShortcut("v", modifiers: [.command, .shift])
@@ -82,6 +177,25 @@ struct VeloraApp: App {
             }
         }
 
+        MenuBarExtra {
+            MenuBarQueueView(
+                engineManager: engineManager,
+                downloadManager: downloadManager,
+                studio: studioState,
+                onOpenMainWindow: { openMainWindow() }
+            )
+            .tint(VeloraTheme.accent)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.down.circle")
+                if downloadManager.activeCount > 0 {
+                    Text("\(downloadManager.activeCount)")
+                        .monospacedDigit()
+                }
+            }
+        }
+        .menuBarExtraStyle(.window)
+
         Settings {
             SettingsView(
                 engineManager: engineManager,
@@ -89,15 +203,116 @@ struct VeloraApp: App {
                 updateChecker: updateChecker,
                 studio: studioState
             )
+            .tint(VeloraTheme.accent)
         }
+    }
+
+    private func openMainWindow() {
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func configureAppLifecycle() {
+        studioState.mainWindowOpener = { [openWindow] in
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        appDelegate.onConfirmQuit = { [weak downloadManager] in
+            downloadManager?.hasActiveDownloads ?? false
+        }
+        appDelegate.onTerminate = { [weak downloadManager] in
+            downloadManager?.terminateAllOnQuit()
+        }
+
+        downloadManager.onQueueChanged = { [weak downloadManager] in
+            guard let downloadManager else { return }
+            MacSystemBridge.shared.updateDockBadge(
+                activeCount: downloadManager.activeCount,
+                pausedCount: downloadManager.pausedCount
+            )
+        }
+
+        downloadManager.onTaskFinished = { [weak studioState] task, succeeded in
+            let enabled = studioState?.systemNotificationsEnabled ?? true
+            MacSystemBridge.shared.postCompletionNotification(
+                title: task.title,
+                succeeded: succeeded,
+                detail: task.statusDetail,
+                enabled: enabled
+            )
+        }
+
+        MacSystemBridge.shared.updateDockBadge(
+            activeCount: downloadManager.activeCount,
+            pausedCount: downloadManager.pausedCount
+        )
+    }
+
+    private func handleDeepLink(_ url: URL) {
+        guard let action = VeloraDeepLinkParser.parse(url) else {
+            studioState.showToast("Ignored invalid velora:// link.", kind: .warning)
+            return
+        }
+
+        openMainWindow()
+        studioState.selectedSection = .studio
+        studioState.isBatchMode = false
+
+        switch action {
+        case .inspect(let mediaURL):
+            studioState.urlInput = mediaURL
+            studioState.startInspectingCurrentURL(engineManager: engineManager)
+
+        case .download(let mediaURL, let presetQuery):
+            studioState.urlInput = mediaURL
+            if let presetQuery {
+                if let matched = matchPreset(query: presetQuery) {
+                    studioState.applyPreset(matched)
+                }
+            }
+            studioState.startDownload(downloadManager: downloadManager, engineManager: engineManager)
+        }
+    }
+
+    private func matchPreset(query: String) -> DownloadPreset? {
+        if let id = UUID(uuidString: query) {
+            return downloadManager.allPresets.first { $0.id == id }
+        }
+        let lowered = query.lowercased()
+        return downloadManager.allPresets.first { $0.name.lowercased() == lowered }
     }
 }
 
+@MainActor
 final class VeloraAppDelegate: NSObject, NSApplicationDelegate {
+    var onConfirmQuit: (() -> Bool)?
+    var onTerminate: (() -> Void)?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ensure bare `swift run` launches also activate properly as a foreground macOS GUI app.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard onConfirmQuit?() == true else {
+            return .terminateNow
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Active Downloads Running"
+        alert.informativeText = "Active downloads are running. Quit and pause them for resume later?"
+        alert.addButton(withTitle: "Quit & Pause")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        return response == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        onTerminate?()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -108,11 +323,12 @@ final class VeloraAppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 @Observable
 final class StudioViewModel {
+    var selectedSection: AppSection = .studio
     var urlInput: String = ""
     var isBatchMode: Bool = false
     var configuration: DownloadConfiguration {
         didSet {
-            store.saveLastConfiguration(configuration)
+            scheduleDebouncedConfigurationSave()
         }
     }
 
@@ -126,13 +342,45 @@ final class StudioViewModel {
     var expandPlaylistsInBatch: Bool = true
     var isExpandingBulk: Bool = false
     var bulkExpansionStatus: String = ""
-    var toastMessage: String?
+    var activeToast: ToastItem?
+
+    var customFormatIsVideoOnly: Bool = false
+    var isAllOptionsExpanded: Bool = false
+    var focusURLRequestToken: UUID = UUID()
+    var clipboardSuggestionURL: String? = nil
+    var mainWindowOpener: (() -> Void)?
+
+    var smartClipboardEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(smartClipboardEnabled, forKey: Keys.smartClipboard)
+            if !smartClipboardEnabled {
+                clipboardSuggestionURL = nil
+            }
+        }
+    }
+
+    var systemNotificationsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(systemNotificationsEnabled, forKey: Keys.systemNotifications)
+        }
+    }
+
+    private enum Keys {
+        static let smartClipboard = "velora.ux.smartClipboard"
+        static let systemNotifications = "velora.ux.systemNotifications"
+    }
 
     private let store: VeloraStore
     private var inspectTask: Task<Void, Never>?
+    private var saveConfigTask: Task<Void, Never>?
+    private var toastDismissTask: Task<Void, Never>?
 
     var canDownload: Bool {
-        !urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if isBatchMode || urlInput.contains("\n") {
+            return !detectedBatchURLs.isEmpty
+        }
+        let trimmed = YTDLPCommandBuilder.sanitizeURL(urlInput)
+        return YTDLPCommandBuilder.isValidMediaURL(trimmed) || PlaylistURLDetector.isPurePlaylistURL(trimmed)
     }
 
     var detectedBatchURLs: [String] {
@@ -146,6 +394,28 @@ final class StudioViewModel {
     init(store: VeloraStore = VeloraStore()) {
         self.store = store
         self.configuration = store.loadLastConfiguration()
+
+        if UserDefaults.standard.object(forKey: Keys.smartClipboard) != nil {
+            self.smartClipboardEnabled = UserDefaults.standard.bool(forKey: Keys.smartClipboard)
+        } else {
+            self.smartClipboardEnabled = true
+        }
+
+        if UserDefaults.standard.object(forKey: Keys.systemNotifications) != nil {
+            self.systemNotificationsEnabled = UserDefaults.standard.bool(forKey: Keys.systemNotifications)
+        } else {
+            self.systemNotificationsEnabled = true
+        }
+    }
+
+    private func scheduleDebouncedConfigurationSave() {
+        let snapshot = configuration
+        saveConfigTask?.cancel()
+        saveConfigTask = Task { [store] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            store.enqueueSaveLastConfiguration(snapshot)
+        }
     }
 
     func applyPreset(_ preset: DownloadPreset) {
@@ -153,7 +423,8 @@ final class StudioViewModel {
         var updated = preset.configuration
         updated.outputDirectoryPath = currentOutDir
         configuration = updated
-        showToast("Applied preset: \(preset.name)")
+        customFormatIsVideoOnly = false
+        showToast("Applied preset: \(preset.name)", kind: .success)
     }
 
     func cancelInspection() {
@@ -236,9 +507,11 @@ final class StudioViewModel {
         if extracted.count > 1 {
             isBatchMode = true
             urlInput = extracted.joined(separator: "\n")
+            clipboardSuggestionURL = nil
         } else {
             isBatchMode = false
             urlInput = extracted.first ?? str
+            clipboardSuggestionURL = nil
             startInspectingCurrentURL(engineManager: engineManager)
         }
     }
@@ -259,18 +532,24 @@ final class StudioViewModel {
             createSubfolder: createSubfolder,
             prefixIndex: prefixIndex
         )
-        showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(mediaInfo.title)\"")
+        showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(mediaInfo.title)\"", kind: .success)
     }
 
     func startDownload(downloadManager: DownloadManager, engineManager: EngineManager) {
         let trimmed = YTDLPCommandBuilder.sanitizeURL(urlInput)
         guard !trimmed.isEmpty, !isExpandingBulk else { return }
 
+        guard engineManager.isReadyForBasicDownloads else {
+            isShowingEngineSetup = true
+            showToast("Install yt-dlp via Engine Setup first.", kind: .warning)
+            return
+        }
+
         // 1. Batch Mode (or multiline paste)
         if isBatchMode || trimmed.contains("\n") {
             let urls = YTDLPCommandBuilder.extractURLs(from: trimmed)
             guard !urls.isEmpty else {
-                showToast("No valid http/https URLs found.")
+                showToast("No valid http/https URLs found.", kind: .warning)
                 return
             }
 
@@ -280,7 +559,7 @@ final class StudioViewModel {
 
             if playlistURLs.isEmpty {
                 let added = downloadManager.enqueueURLs(urls, configuration: configuration)
-                showToast("Queued \(added.count) download\(added.count == 1 ? "" : "s")")
+                showToast("Queued \(added.count) download\(added.count == 1 ? "" : "s")", kind: .success)
                 urlInput = ""
                 inspectedMedia = nil
                 return
@@ -345,7 +624,7 @@ final class StudioViewModel {
                 self.bulkExpansionStatus = ""
                 self.urlInput = ""
                 self.inspectedMedia = nil
-                self.showToast("Queued \(totalQueued) download\(totalQueued == 1 ? "" : "s") across bulk batch")
+                self.showToast("Queued \(totalQueued) download\(totalQueued == 1 ? "" : "s") across bulk batch", kind: .success)
             }
             return
         }
@@ -415,19 +694,19 @@ final class StudioViewModel {
                             createSubfolder: configSnapshot.createPlaylistSubfolder,
                             prefixIndex: true
                         )
-                        self.showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(info.title)\"")
+                        self.showToast("Queued \(added.count) video\(added.count == 1 ? "" : "s") from \"\(info.title)\"", kind: .success)
                     } else {
                         var fallbackConfig = configSnapshot
                         fallbackConfig.playlistBehavior = .downloadEntirePlaylist
                         downloadManager.enqueue(url: trimmed, configuration: fallbackConfig, mediaInfo: info)
-                        self.showToast("Added playlist to download queue")
+                        self.showToast("Added playlist to download queue", kind: .success)
                     }
                 } catch {
                     // Graceful fallback to direct yt-dlp --yes-playlist
                     var fallbackConfig = configSnapshot
                     fallbackConfig.playlistBehavior = .downloadEntirePlaylist
                     downloadManager.enqueue(url: trimmed, configuration: fallbackConfig)
-                    self.showToast("Added playlist to download queue")
+                    self.showToast("Added playlist to download queue", kind: .success)
                 }
                 self.isExpandingBulk = false
                 self.bulkExpansionStatus = ""
@@ -436,25 +715,40 @@ final class StudioViewModel {
         }
 
         // 4. Standard single video download
+        if downloadManager.hasPendingOrActiveDownload(for: trimmed) {
+            showToast("This URL is already active or queued.", kind: .info)
+            return
+        }
+
         let matchesInspected: Bool = {
             guard let media = inspectedMedia else { return false }
             return media.webpageURL == trimmed || (!media.id.isEmpty && trimmed.contains(media.id))
         }()
-        downloadManager.enqueue(
+
+        let queued = downloadManager.enqueue(
             url: trimmed,
             configuration: configuration,
-            mediaInfo: matchesInspected ? inspectedMedia : nil
+            mediaInfo: matchesInspected ? inspectedMedia : nil,
+            customFormatIsVideoOnly: customFormatIsVideoOnly
         )
-        showToast("Added to download queue")
-        configuration.customFormatID = nil
+        if queued != nil {
+            showToast("Added to download queue", kind: .success)
+            configuration.customFormatID = nil
+            customFormatIsVideoOnly = false
+        } else {
+            showToast("Enter a valid http or https URL.", kind: .warning)
+        }
     }
 
-    func showToast(_ message: String) {
-        toastMessage = message
-        Task {
+    func showToast(_ message: String, kind: ToastKind = .success) {
+        let item = ToastItem(message: message, kind: kind)
+        activeToast = item
+        toastDismissTask?.cancel()
+        toastDismissTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(2.8))
-            if toastMessage == message {
-                toastMessage = nil
+            guard !Task.isCancelled else { return }
+            if self?.activeToast?.id == item.id {
+                self?.activeToast = nil
             }
         }
     }

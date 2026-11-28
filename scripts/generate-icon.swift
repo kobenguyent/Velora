@@ -3,7 +3,8 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-// Renders a crisp native macOS squircle AppIcon.iconset (16px through 1024px) with zero external dependencies.
+// Renders a crisp native macOS squircle AppIcon.iconset (16px through 1024px)
+// in the Precision Studio Cobalt aesthetic with zero external dependencies.
 
 guard CommandLine.arguments.count >= 2 else {
     fputs("Usage: generate-icon.swift <output-iconset-dir>\n", stderr)
@@ -12,6 +13,13 @@ guard CommandLine.arguments.count >= 2 else {
 
 let iconsetURL = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 try FileManager.default.createDirectory(at: iconsetURL, withIntermediateDirectories: true)
+
+func srgb(_ hex: UInt32, alpha: CGFloat = 1.0) -> CGColor {
+    let r = CGFloat((hex >> 16) & 0xFF) / 255.0
+    let g = CGFloat((hex >> 8) & 0xFF) / 255.0
+    let b = CGFloat(hex & 0xFF) / 255.0
+    return CGColor(srgbRed: r, green: g, blue: b, alpha: alpha)
+}
 
 func renderIcon(pixelSize: Int) -> Data? {
     let size = CGFloat(pixelSize)
@@ -32,7 +40,7 @@ func renderIcon(pixelSize: Int) -> Data? {
     ctx.setAllowsAntialiasing(true)
     ctx.setShouldAntialias(true)
 
-    // macOS Big Sur+ icon inset (~9.7% margin for standard squircle visual weight)
+    // macOS Big Sur+ icon inset (~9.5% margin for standard squircle visual weight)
     let inset = size * 0.095
     let cardRect = CGRect(x: inset, y: inset, width: size - inset * 2, height: size - inset * 2)
     let cornerRadius = cardRect.width * 0.225
@@ -43,10 +51,10 @@ func renderIcon(pixelSize: Int) -> Data? {
     ctx.setShadow(
         offset: CGSize(width: 0, height: -size * 0.018),
         blur: size * 0.04,
-        color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.35)
+        color: CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.36)
     )
     ctx.addPath(cardPath)
-    ctx.setFillColor(CGColor(red: 0.06, green: 0.07, blue: 0.13, alpha: 1.0))
+    ctx.setFillColor(srgb(0x0E1014))
     ctx.fillPath()
     ctx.restoreGState()
 
@@ -55,13 +63,13 @@ func renderIcon(pixelSize: Int) -> Data? {
     ctx.addPath(cardPath)
     ctx.clip()
 
-    // Deep obsidian-indigo background gradient
+    // Deep carbon obsidian studio gradient (#0E1014 -> #161B26)
     let bgColors = [
-        CGColor(red: 0.07, green: 0.07, blue: 0.16, alpha: 1.0),
-        CGColor(red: 0.11, green: 0.08, blue: 0.25, alpha: 1.0),
-        CGColor(red: 0.04, green: 0.11, blue: 0.21, alpha: 1.0)
+        srgb(0x0E1014),
+        srgb(0x12161F),
+        srgb(0x161B26)
     ] as CFArray
-    if let bgGradient = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: [0.0, 0.52, 1.0]) {
+    if let bgGradient = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: [0.0, 0.5, 1.0]) {
         ctx.drawLinearGradient(
             bgGradient,
             start: CGPoint(x: cardRect.minX, y: cardRect.maxY),
@@ -70,43 +78,29 @@ func renderIcon(pixelSize: Int) -> Data? {
         )
     }
 
-    // Iridescent top-left violet aurora glow
-    let violetGlowColors = [
-        CGColor(red: 0.56, green: 0.35, blue: 1.0, alpha: 0.55),
-        CGColor(red: 0.56, green: 0.35, blue: 1.0, alpha: 0.0)
+    // Restrained Cobalt studio top-light radial ambient sheen
+    let cobaltSheenColors = [
+        srgb(0x5B6CFF, alpha: 0.20),
+        srgb(0x3B49DF, alpha: 0.07),
+        srgb(0x3B49DF, alpha: 0.0)
     ] as CFArray
-    if let glow = CGGradient(colorsSpace: colorSpace, colors: violetGlowColors, locations: [0.0, 1.0]) {
+    if let sheen = CGGradient(colorsSpace: colorSpace, colors: cobaltSheenColors, locations: [0.0, 0.45, 1.0]) {
+        let sheenCenter = CGPoint(x: cardRect.midX, y: cardRect.maxY - cardRect.height * 0.22)
         ctx.drawRadialGradient(
-            glow,
-            startCenter: CGPoint(x: cardRect.minX + cardRect.width * 0.25, y: cardRect.maxY - cardRect.height * 0.2),
+            sheen,
+            startCenter: sheenCenter,
             startRadius: 0,
-            endCenter: CGPoint(x: cardRect.minX + cardRect.width * 0.25, y: cardRect.maxY - cardRect.height * 0.2),
-            endRadius: cardRect.width * 0.65,
+            endCenter: sheenCenter,
+            endRadius: cardRect.width * 0.72,
             options: []
         )
     }
 
-    // Iridescent bottom-right cyan aurora glow
-    let cyanGlowColors = [
-        CGColor(red: 0.10, green: 0.85, blue: 0.96, alpha: 0.45),
-        CGColor(red: 0.10, green: 0.85, blue: 0.96, alpha: 0.0)
-    ] as CFArray
-    if let glow = CGGradient(colorsSpace: colorSpace, colors: cyanGlowColors, locations: [0.0, 1.0]) {
-        ctx.drawRadialGradient(
-            glow,
-            startCenter: CGPoint(x: cardRect.maxX - cardRect.width * 0.22, y: cardRect.minY + cardRect.height * 0.2),
-            startRadius: 0,
-            endCenter: CGPoint(x: cardRect.maxX - cardRect.width * 0.22, y: cardRect.minY + cardRect.height * 0.2),
-            endRadius: cardRect.width * 0.62,
-            options: []
-        )
-    }
-
-    // Subtle precision aperture ring
+    // Precision machined studio aperture ring
     let center = CGPoint(x: size * 0.5, y: size * 0.5)
-    let ringRadius = cardRect.width * 0.34
-    ctx.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.14))
-    ctx.setLineWidth(max(1.0, size * 0.012))
+    let ringRadius = cardRect.width * 0.345
+    ctx.setStrokeColor(srgb(0xFFFFFF, alpha: 0.08))
+    ctx.setLineWidth(max(1.0, size * 0.01))
     ctx.strokeEllipse(in: CGRect(
         x: center.x - ringRadius,
         y: center.y - ringRadius,
@@ -114,19 +108,20 @@ func renderIcon(pixelSize: Int) -> Data? {
         height: ringRadius * 2
     ))
 
-    // Stylised Velora "V" / downward prism arrow emblem
-    let chevronPath = CGMutablePath()
+    // Geometric Cobalt & Pearl-White "V" Prism Emblem
     let topY = center.y + cardRect.height * 0.22
-    let midY = center.y - cardRect.height * 0.14
-    let leftX = center.x - cardRect.width * 0.23
-    let rightX = center.x + cardRect.width * 0.23
+    let apexY = center.y - cardRect.height * 0.145
+    let leftX = center.x - cardRect.width * 0.235
+    let rightX = center.x + cardRect.width * 0.235
+    let strokeWidth = max(2.0, cardRect.width * 0.115)
 
-    chevronPath.move(to: CGPoint(x: leftX, y: topY))
-    chevronPath.addLine(to: CGPoint(x: center.x, y: midY))
-    chevronPath.addLine(to: CGPoint(x: rightX, y: topY))
+    // Left + base Cobalt prism chevron (#5B6CFF -> #3B49DF)
+    let fullChevron = CGMutablePath()
+    fullChevron.move(to: CGPoint(x: leftX, y: topY))
+    fullChevron.addLine(to: CGPoint(x: center.x, y: apexY))
+    fullChevron.addLine(to: CGPoint(x: rightX, y: topY))
 
-    let strokeWidth = max(2.0, cardRect.width * 0.11)
-    let strokedChevron = chevronPath.copy(
+    let strokedChevron = fullChevron.copy(
         strokingWithWidth: strokeWidth,
         lineCap: .round,
         lineJoin: .round,
@@ -136,28 +131,57 @@ func renderIcon(pixelSize: Int) -> Data? {
     ctx.saveGState()
     ctx.setShadow(
         offset: CGSize(width: 0, height: -size * 0.015),
-        blur: size * 0.04,
-        color: CGColor(red: 0.13, green: 0.83, blue: 0.93, alpha: 0.55)
+        blur: size * 0.045,
+        color: srgb(0x3B49DF, alpha: 0.45)
     )
     ctx.addPath(strokedChevron)
     ctx.clip()
 
-    let emblemColors = [
-        CGColor(red: 0.77, green: 0.58, blue: 1.0, alpha: 1.0),
-        CGColor(red: 0.44, green: 0.69, blue: 1.0, alpha: 1.0),
-        CGColor(red: 0.15, green: 0.92, blue: 0.96, alpha: 1.0)
+    let cobaltColors = [
+        srgb(0x5B6CFF),
+        srgb(0x4A5AF0),
+        srgb(0x3B49DF)
     ] as CFArray
-    if let emblemGrad = CGGradient(colorsSpace: colorSpace, colors: emblemColors, locations: [0.0, 0.5, 1.0]) {
+    if let cobaltGrad = CGGradient(colorsSpace: colorSpace, colors: cobaltColors, locations: [0.0, 0.5, 1.0]) {
         ctx.drawLinearGradient(
-            emblemGrad,
+            cobaltGrad,
             start: CGPoint(x: leftX, y: topY + strokeWidth),
-            end: CGPoint(x: rightX, y: midY - strokeWidth),
+            end: CGPoint(x: rightX, y: apexY - strokeWidth),
             options: []
         )
     }
     ctx.restoreGState()
 
-    // Sleek luminous download tray bar beneath the V prism
+    // Crisp pearl-white specular prism wing on the right facet for sharp contrast at all sizes
+    let pearlWing = CGMutablePath()
+    pearlWing.move(to: CGPoint(x: center.x + cardRect.width * 0.02, y: apexY + cardRect.height * 0.032))
+    pearlWing.addLine(to: CGPoint(x: rightX, y: topY))
+
+    let strokedPearlWing = pearlWing.copy(
+        strokingWithWidth: strokeWidth * 0.58,
+        lineCap: .round,
+        lineJoin: .round,
+        miterLimit: 4
+    )
+
+    ctx.saveGState()
+    ctx.addPath(strokedPearlWing)
+    ctx.clip()
+    let pearlColors = [
+        srgb(0xF4F6FA, alpha: 0.96),
+        srgb(0xDDE4FA, alpha: 0.88)
+    ] as CFArray
+    if let pearlGrad = CGGradient(colorsSpace: colorSpace, colors: pearlColors, locations: [0.0, 1.0]) {
+        ctx.drawLinearGradient(
+            pearlGrad,
+            start: CGPoint(x: rightX, y: topY),
+            end: CGPoint(x: center.x, y: apexY),
+            options: []
+        )
+    }
+    ctx.restoreGState()
+
+    // Crisp pearl-white download tray bar beneath the "V" prism
     let trayWidth = cardRect.width * 0.36
     let trayHeight = max(2.0, cardRect.height * 0.068)
     let trayRect = CGRect(
@@ -166,16 +190,21 @@ func renderIcon(pixelSize: Int) -> Data? {
         width: trayWidth,
         height: trayHeight
     )
-    let trayPath = CGPath(roundedRect: trayRect, cornerWidth: trayHeight * 0.5, cornerHeight: trayHeight * 0.5, transform: nil)
+    let trayPath = CGPath(
+        roundedRect: trayRect,
+        cornerWidth: trayHeight * 0.5,
+        cornerHeight: trayHeight * 0.5,
+        transform: nil
+    )
     ctx.saveGState()
     ctx.addPath(trayPath)
-    ctx.setFillColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.92))
+    ctx.setFillColor(srgb(0xF4F6FA, alpha: 0.95))
     ctx.fillPath()
     ctx.restoreGState()
 
-    // Glass rim highlight around the squircle
+    // Subtle studio rim highlight around the squircle
     ctx.addPath(cardPath)
-    ctx.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.20))
+    ctx.setStrokeColor(srgb(0xFFFFFF, alpha: 0.14))
     ctx.setLineWidth(max(1.0, size * 0.012))
     ctx.strokePath()
 

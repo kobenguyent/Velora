@@ -10,196 +10,244 @@ struct MediaPreviewCard: View {
     let onQueueAllPlaylist: () -> Void
     let onLoadLinkedPlaylist: () -> Void
 
+    @Environment(\.veloraLayout) private var layout
+
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
-            thumbnailView
-                .frame(width: 196, height: 112)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(VeloraTheme.subtleCardBorder, lineWidth: 1)
-                )
+            thumbnailWithBadges
 
             VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 8) {
-                    if let extractor = mediaInfo.extractor {
-                        VeloraBadge(text: extractor, color: VeloraTheme.violet, icon: "globe")
-                    }
-                    if mediaInfo.isPlaylist, let count = mediaInfo.playlistCount {
-                        VeloraBadge(text: "Playlist · \(count) videos", color: VeloraTheme.cyan, icon: "list.bullet.rectangle")
-                    }
-                    if mediaInfo.isPlaylist, let totalDur = mediaInfo.totalPlaylistDurationFormatted {
-                        VeloraBadge(text: totalDur, color: .secondary, icon: "clock")
-                    } else if let duration = mediaInfo.formattedDuration {
-                        VeloraBadge(text: duration, color: .secondary, icon: "clock")
-                    }
-                    Spacer()
-                }
+                metadataBadgesRow
 
                 Text(mediaInfo.title)
-                    .font(.headline)
+                    .font(layout.font(16, weight: .semibold))
+                    .foregroundStyle(VeloraTheme.inkPrimary)
                     .lineLimit(2)
 
-                HStack(spacing: 12) {
-                    if let uploader = mediaInfo.uploader {
-                        Label(uploader, systemImage: "person.crop.circle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let views = mediaInfo.formattedViewCount {
-                        Label("\(views) views", systemImage: "eye")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                uploaderAndViewsRow
 
                 if mediaInfo.isPlaylist && !mediaInfo.playlistEntries.isEmpty {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(mediaInfo.playlistEntries.prefix(3)) { entry in
-                            HStack(spacing: 6) {
-                                Text(String(format: "#%02d", entry.index))
-                                    .font(.system(.caption2, design: .monospaced, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                                Text(entry.title)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                Spacer()
-                                if let dur = entry.formattedDuration {
-                                    Text(dur)
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                        }
-                        if mediaInfo.playlistEntries.count > 3 {
-                            Text("…and \(mediaInfo.playlistEntries.count - 3) more videos")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(nsColor: .textBackgroundColor).opacity(0.6))
-                    )
+                    playlistPreviewList
                 } else if !mediaInfo.availableHeights.isEmpty {
-                    HStack(spacing: 6) {
-                        Text("Detected:")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        ForEach(mediaInfo.availableHeights.prefix(6), id: \.self) { h in
-                            Text("\(h)p")
-                                .font(.caption2.weight(.medium).monospacedDigit())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
-                        }
-                    }
+                    detectedHeightsRow
                 }
 
                 Spacer(minLength: 2)
 
-                HStack(spacing: 8) {
-                    if mediaInfo.isPlaylist && !mediaInfo.playlistEntries.isEmpty {
-                        Button {
-                            onOpenPlaylistPicker()
-                        } label: {
-                            Label(
-                                "Select Videos (\(mediaInfo.availablePlaylistEntries.count))…",
-                                systemImage: "checklist"
-                            )
-                            .font(.caption.weight(.semibold))
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(VeloraTheme.violet)
-                        .controlSize(.small)
+                actionBar
+            }
+        }
+        .veloraCard(padding: layout.scaled(16), cornerRadius: 14)
+    }
 
-                        Button {
-                            onQueueAllPlaylist()
-                        } label: {
-                            Label(
-                                "Queue All \(mediaInfo.availablePlaylistEntries.count)",
-                                systemImage: "arrow.down.circle"
-                            )
-                            .font(.caption.weight(.medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    } else {
-                        if !mediaInfo.formats.isEmpty {
-                            Button {
-                                onOpenFormatPicker()
-                            } label: {
-                                Label(
-                                    selectedFormatID == nil ? "Pick Exact Format (\(mediaInfo.formats.count))" : "Format: \(selectedFormatID!)",
-                                    systemImage: "list.bullet.indent"
-                                )
-                                .font(.caption.weight(.medium))
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
+    private var thumbnailWithBadges: some View {
+        let thumbSize = layout.thumbnailSize
+        return ZStack(alignment: .bottomTrailing) {
+            CachedThumbnailView(
+                urlString: mediaInfo.thumbnailURL,
+                width: thumbSize.width,
+                height: thumbSize.height,
+                cornerRadius: 10,
+                maxPixelSize: 400,
+                fallbackSymbol: mediaInfo.isPlaylist ? "list.bullet.rectangle" : "play.rectangle"
+            )
 
-                        if selectedFormatID != nil {
-                            Button("Reset Format") {
-                                onClearFormatOverride()
-                            }
-                            .buttonStyle(.borderless)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
+            if mediaInfo.isLive {
+                Text("LIVE")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(VeloraTheme.danger))
+                    .padding(6)
+            } else if mediaInfo.isPlaylist, let totalDur = mediaInfo.totalPlaylistDurationFormatted {
+                durationOverlayPill(totalDur)
+            } else if let duration = mediaInfo.formattedDuration {
+                durationOverlayPill(duration)
+            }
+        }
+    }
 
-                        if mediaInfo.linkedPlaylistURL != nil {
-                            Button {
-                                onLoadLinkedPlaylist()
-                            } label: {
-                                Label("Load Full Playlist", systemImage: "list.bullet.rectangle.portrait")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(VeloraTheme.cyan)
-                            .controlSize(.small)
-                            .help("This video is part of a YouTube playlist — expand to select and bulk-download videos")
-                        }
+    private func durationOverlayPill(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.black.opacity(0.75)))
+            .padding(6)
+            .accessibilityLabel("Duration \(text)")
+    }
+
+    private var metadataBadgesRow: some View {
+        FlowWrapLayout(alignment: .leading, spacing: 6, lineSpacing: 6) {
+            if let extractor = mediaInfo.extractor {
+                VeloraBadge(text: extractor, color: VeloraTheme.accentText, icon: "globe")
+            }
+            if mediaInfo.isPlaylist, let count = mediaInfo.playlistCount {
+                VeloraBadge(text: "Playlist · \(count)", color: VeloraTheme.info, icon: "list.bullet.rectangle")
+            }
+            if mediaInfo.isLive {
+                VeloraBadge(text: "Live Stream", color: VeloraTheme.danger, icon: "dot.radiowaves.left.and.right")
+            }
+        }
+    }
+
+    private var uploaderAndViewsRow: some View {
+        HStack(spacing: 12) {
+            if let uploader = mediaInfo.uploader {
+                Label(uploader, systemImage: "person.crop.circle")
+                    .font(layout.font(12.5))
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                    .lineLimit(1)
+            }
+            if let views = mediaInfo.formattedViewCount {
+                Label("\(views) views", systemImage: "eye")
+                    .font(layout.font(12.5))
+                    .monospacedDigit()
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+            }
+        }
+    }
+
+    private var playlistPreviewList: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(mediaInfo.playlistEntries.prefix(3)) { entry in
+                HStack(spacing: 6) {
+                    Text(String(format: "#%02d", entry.index))
+                        .font(.system(.caption2, design: .monospaced, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(VeloraTheme.inkSecondary)
+                    Text(entry.title)
+                        .font(.caption2)
+                        .foregroundStyle(VeloraTheme.inkPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    if let dur = entry.formattedDuration {
+                        Text(dur)
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(VeloraTheme.inkSecondary)
                     }
                 }
             }
+            if mediaInfo.playlistEntries.count > 3 {
+                Text("…and \(mediaInfo.playlistEntries.count - 3) more videos")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+            }
         }
-        .veloraCard(padding: 14)
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(VeloraTheme.surfaceSubtle)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(VeloraTheme.hairline, lineWidth: 1)
+        )
+    }
+
+    private var detectedHeightsRow: some View {
+        FlowWrapLayout(alignment: .leading, spacing: 5, lineSpacing: 5) {
+            Text("Streams:")
+                .font(layout.font(11.5))
+                .foregroundStyle(VeloraTheme.inkSecondary)
+
+            ForEach(mediaInfo.availableHeights.prefix(5), id: \.self) { h in
+                Text("\(h)p")
+                    .font(layout.font(11.5, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(VeloraTheme.inkPrimary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(VeloraTheme.surfaceSubtle)
+                    )
+            }
+        }
     }
 
     @ViewBuilder
-    private var thumbnailView: some View {
-        if let thumbStr = mediaInfo.thumbnailURL, let url = URL(string: thumbStr) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                case .failure:
-                    placeholderThumb
-                case .empty:
-                    ZStack {
-                        placeholderThumb
-                        ProgressView().controlSize(.small)
+    private var actionBar: some View {
+        FlowWrapLayout(alignment: .leading, spacing: 8, lineSpacing: 6) {
+            if mediaInfo.isPlaylist && !mediaInfo.playlistEntries.isEmpty {
+                Button {
+                    onOpenPlaylistPicker()
+                } label: {
+                    Label(
+                        "Select Videos (\(mediaInfo.availablePlaylistEntries.count))…",
+                        systemImage: "checklist"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                }
+                .buttonStyle(VeloraPrimaryButtonStyle())
+                .controlSize(.small)
+
+                Button {
+                    onQueueAllPlaylist()
+                } label: {
+                    Label(
+                        "Queue All \(mediaInfo.availablePlaylistEntries.count)",
+                        systemImage: "arrow.down.circle"
+                    )
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                }
+                .buttonStyle(VeloraSecondaryButtonStyle())
+                .controlSize(.small)
+            } else {
+                if !mediaInfo.formats.isEmpty {
+                    Button {
+                        onOpenFormatPicker()
+                    } label: {
+                        Label(
+                            selectedFormatID == nil
+                                ? "Pick Format (\(mediaInfo.formats.count))"
+                                : "Format: \(selectedFormatID!)",
+                            systemImage: "list.bullet.indent"
+                        )
+                        .font(.caption.weight(.medium))
+                        .monospacedDigit()
                     }
-                @unknown default:
-                    placeholderThumb
+                    .buttonStyle(VeloraSecondaryButtonStyle())
+                    .controlSize(.small)
+                } else {
+                    Text("No selectable streams")
+                        .font(.caption)
+                        .foregroundStyle(VeloraTheme.inkSecondary)
+                }
+
+                if selectedFormatID != nil {
+                    Button("Reset Format") {
+                        onClearFormatOverride()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(VeloraTheme.inkSecondary)
+                    .padding(.horizontal, 6)
+                    .frame(minWidth: 24, minHeight: 24)
+                    .contentShape(Rectangle())
+                    .veloraFocusableRing(cornerRadius: 6)
+                    .accessibilityLabel("Reset custom format override")
+                }
+
+                if mediaInfo.linkedPlaylistURL != nil {
+                    Button {
+                        onLoadLinkedPlaylist()
+                    } label: {
+                        Label("Load Full Playlist", systemImage: "list.bullet.rectangle.portrait")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(VeloraSecondaryButtonStyle())
+                    .controlSize(.small)
+                    .help("This video is part of a playlist — expand to select and bulk-download videos")
                 }
             }
-        } else {
-            placeholderThumb
-        }
-    }
-
-    private var placeholderThumb: some View {
-        ZStack {
-            VeloraTheme.brandGradient.opacity(0.22)
-            Image(systemName: mediaInfo.isPlaylist ? "list.bullet.rectangle.fill" : "play.rectangle.fill")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
         }
     }
 }
