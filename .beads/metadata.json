@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "velora",
+  "project_id": "afd9352a-f43c-4c70-ae67-c76dc17c1e10"
+}
